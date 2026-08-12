@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import fsPromises from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import type { Router } from 'express';
 import type { Pool } from 'pg';
+import { CopilotProvider } from '@codewithdan/agent-sdk-core';
 import { initPostgresDatabase, migrateSqliteDatabase } from '../src/db.js';
 import { SqliteTaskRepository } from '../src/repositories/sqlite.js';
 import { PostgresTaskRepository } from '../src/repositories/postgres.js';
@@ -17,9 +19,12 @@ import {
   AgentManager,
   buildAgentExecutionPrompt,
   buildAgentSystemPrompt,
+  evaluateRevisionToolUse,
   inspectRevisionCompletion,
   isRevisionCommitOnRemote,
+  providerSupportsRevisionToolGuard,
   resolveRevisionPushIntent,
+  resolveRevisionPushPermission,
   type AgentRunOptions,
 } from '../src/services/agent-manager.js';
 
@@ -302,6 +307,102 @@ test('completed no-push revision is durably finalized as held', async () => {
   }
 });
 
+test('completed ambiguous revision is durably held and cannot release an earlier hold', async () => {
+  const { db, repo } = makeRepo();
+  try {
+    await repo.create(reviewTask());
+    const earlier = await repo.beginRevision({
+      id: 'earlier-held-revision',
+      taskId: 'task-1',
+      feedback: '不要推送。',
+      createdAt: 250,
+    });
+    assert.ok(earlier);
+    await repo.finalizeRevision(earlier.revision.id, {
+      status: 'complete',
+      completedAt: 275,
+      agentSummary: 'Held locally',
+      commitSha: 'abc1234',
+      pushStatus: 'held',
+      releaseHeldRevisions: false,
+    });
+    await repo.update('task-1', { columnId: 'review', agentStatus: 'complete' });
+
+    let capturedOptions: AgentRunOptions | undefined;
+    const manager = {
+      isRunning: () => false,
+      resetEvents: () => {},
+      startAgent: (_task: Task, _onStatus?: unknown, _onWorktree?: unknown, options?: AgentRunOptions) => {
+        capturedOptions = options;
+      },
+    } as unknown as AgentManager;
+    const response = await invokeRoute(createRevisionsRouter(repo, manager), 'post', '/:id/request-changes', {
+      params: { id: 'task-1' },
+      body: { feedback: '继续修复空状态。' },
+    });
+    assert.equal(response.status, 201);
+    assert.equal(capturedOptions?.revision?.hasHeldRevisions, true);
+    assert.ok(capturedOptions?.onComplete);
+    await capturedOptions.onComplete({
+      revisionId: (response.body as { revision: { id: string } }).revision.id,
+      status: 'complete',
+      agentSummary: 'Second local revision',
+      commitSha: 'def5678',
+      pushed: false,
+    });
+
+    const revisions = await repo.getRevisionsByTaskId('task-1');
+    assert.deepEqual(revisions.map((revision) => revision.pushStatus), ['held', 'held']);
+    assert.equal(revisions[0].releasedByRevisionId, null);
+    assert.equal(await repo.hasHeldRevisions('task-1'), true);
+  } finally {
+    db.close();
+  }
+});
+
+test('completion metadata cannot mark or release an unauthorized revision as pushed', async () => {
+  const { db, repo } = makeRepo();
+  try {
+    await repo.create(reviewTask());
+    const earlier = await repo.beginRevision({
+      id: 'metadata-held-revision',
+      taskId: 'task-1',
+      feedback: '不要推送。',
+      createdAt: 200,
+    });
+    assert.ok(earlier);
+    await repo.finalizeRevision(earlier.revision.id, {
+      status: 'complete', completedAt: 225, agentSummary: 'Held', commitSha: 'abc1234',
+      pushStatus: 'held', releaseHeldRevisions: false,
+    });
+    await repo.update('task-1', { columnId: 'review', agentStatus: 'complete' });
+
+    let capturedOptions: AgentRunOptions | undefined;
+    const manager = {
+      isRunning: () => false,
+      resetEvents: () => {},
+      startAgent: (_task: Task, _onStatus?: unknown, _onWorktree?: unknown, options?: AgentRunOptions) => {
+        capturedOptions = options;
+      },
+    } as unknown as AgentManager;
+    const response = await invokeRoute(createRevisionsRouter(repo, manager), 'post', '/:id/request-changes', {
+      params: { id: 'task-1' },
+      body: { feedback: '继续修复，但不要推送。' },
+    });
+    assert.equal(response.status, 201);
+    assert.ok(capturedOptions?.onComplete);
+    await capturedOptions.onComplete({
+      status: 'complete', agentSummary: 'Local only', commitSha: 'def5678', pushed: true,
+    });
+
+    const revisions = await repo.getRevisionsByTaskId('task-1');
+    assert.deepEqual(revisions.map((revision) => revision.pushStatus), ['held', 'held']);
+    assert.equal(revisions[0].releasedByRevisionId, null);
+  } finally {
+    db.close();
+  }
+});
+
 test('create-pr API persists the pull request URL on the task', async () => {
   const { db, repo } = makeRepo();
   try {
@@ -320,7 +421,7 @@ test('create-pr API persists the pull request URL on the task', async () => {
   }
 });
 
-test('push hold D: existing PR keeps default same-branch push when no hold exists', () => {
+test('revision push defaults to held even when an existing PR has no prior hold', () => {
   const task = reviewTask();
   const prompt = buildAgentExecutionPrompt(task, {
     revisionId: 'revision-1',
@@ -330,7 +431,8 @@ test('push hold D: existing PR keeps default same-branch push when no hold exist
   });
   assert.match(prompt, /NEW revision execution round/);
   assert.match(prompt, /highest priority/);
-  assert.match(prompt, /git push origin task\/review-flow/);
+  assert.match(prompt, /push permission is denied by default/i);
+  assert.doesNotMatch(prompt, /git push origin task\/review-flow/);
   assert.match(prompt, /Never force-push/);
 });
 
@@ -378,7 +480,7 @@ test('push hold A-C: held commit blocks defaults until explicit authorization re
       completedAt: 600,
       agentSummary: 'Second local fix',
       commitSha: 'fc507de',
-      pushStatus: 'local',
+      pushStatus: 'held',
       releaseHeldRevisions: false,
     });
     assert.equal(await repo.hasHeldRevisions('task-1'), true);
@@ -410,7 +512,7 @@ test('push hold A-C: held commit blocks defaults until explicit authorization re
     });
 
     const history = await repo.getRevisionsByTaskId('task-1');
-    assert.deepEqual(history.map((revision) => revision.pushStatus), ['released', 'pushed', 'pushed']);
+    assert.deepEqual(history.map((revision) => revision.pushStatus), ['released', 'released', 'pushed']);
     assert.equal(history[0].pushedAt, 800);
     assert.equal(history[0].releasedByRevisionId, 'held-revision-3');
     assert.equal(await repo.hasHeldRevisions('task-1'), false);
@@ -426,6 +528,161 @@ test('explicit push release intent requires high-confidence current feedback', (
   assert.equal(resolveRevisionPushIntent('You can push all previous changes.'), 'authorize');
   assert.equal(resolveRevisionPushIntent('继续修复空状态。'), 'unspecified');
   assert.equal(resolveRevisionPushIntent('不可以 push。'), 'prohibit');
+});
+
+test('natural English, Chinese, and mixed-language push prohibitions deny push', () => {
+  for (const feedback of [
+    '不要推送。',
+    '不推送。',
+    '暂不推送。',
+    '先不要推送。',
+    '不要 push。',
+    '这次不要提交到远程。',
+    '先保留在本地。',
+    'Do not push.',
+    "Don't push.",
+    'No push.',
+    'Keep these changes local.',
+    'Do not upload these changes to remote.',
+    'Commit locally but do not push.',
+  ]) {
+    assert.equal(resolveRevisionPushIntent(feedback), 'prohibit', feedback);
+    assert.equal(resolveRevisionPushPermission(reviewTask(), {
+      revisionId: 'revision-natural-language',
+      feedback,
+      prUrl: 'https://example.test/pull/1',
+    }).allowed, false, feedback);
+  }
+});
+
+test('commit-local/no-push feedback allows commit while denying push', () => {
+  for (const feedback of [
+    'Commit locally but do not push.',
+    '请在本地 commit，但不要推送。',
+    '本地提交即可，不要提交到远程。',
+  ]) {
+    const prompt = buildAgentExecutionPrompt(reviewTask(), {
+      revisionId: 'revision-local-commit',
+      feedback,
+      prUrl: 'https://example.test/pull/1',
+    });
+    assert.match(prompt, /create a concise commit/i, feedback);
+    assert.match(prompt, /explicitly prohibits push/i, feedback);
+    assert.doesNotMatch(prompt, /Do not create a commit/i, feedback);
+  }
+});
+
+test('ordinary push permission is explicit, branch-scoped, and force-push is never authorized', () => {
+  const authorized = resolveRevisionPushPermission(reviewTask(), {
+    revisionId: 'revision-authorized-push',
+    feedback: 'Please push these changes to the existing PR.',
+    prUrl: 'https://example.test/pull/1',
+  });
+  assert.equal(authorized.allowed, true);
+  assert.equal(
+    evaluateRevisionToolUse({ toolName: 'bash', toolArgs: { command: 'git push origin task/review-flow' } }, authorized).permissionDecision,
+    'allow',
+  );
+  assert.equal(
+    evaluateRevisionToolUse({ toolName: 'bash', toolArgs: { command: 'git push origin another-branch' } }, authorized).permissionDecision,
+    'deny',
+  );
+  for (const command of [
+    'git push --force origin task/review-flow',
+    'git push --force-with-lease origin task/review-flow',
+    'git push -f origin task/review-flow',
+    'git push origin +task/review-flow:task/review-flow',
+  ]) {
+    const decision = evaluateRevisionToolUse({ toolName: 'bash', toolArgs: { command } }, authorized);
+    assert.equal(decision.permissionDecision, 'deny', command);
+    assert.equal(decision.operation, 'force-push', command);
+  }
+});
+
+test('unauthorized remote mutation is denied before a shell executor can run', () => {
+  const denied = resolveRevisionPushPermission(reviewTask(), {
+    revisionId: 'revision-denied-push',
+    feedback: '暂不推送。',
+    prUrl: 'https://example.test/pull/1',
+  });
+  let remoteMutationCount = 0;
+  const executeThroughGuard = (command: string) => {
+    const decision = evaluateRevisionToolUse({ toolName: 'bash', toolArgs: { command } }, denied);
+    if (decision.permissionDecision !== 'deny') remoteMutationCount += 1;
+    return decision;
+  };
+
+  assert.equal(executeThroughGuard('git push origin task/review-flow').permissionDecision, 'deny');
+  assert.equal(executeThroughGuard("sh -c 'git push origin task/review-flow'").permissionDecision, 'deny');
+  assert.equal(executeThroughGuard('env TRACE=1 git push origin task/review-flow').permissionDecision, 'deny');
+  assert.equal(executeThroughGuard('git push --force-with-lease origin task/review-flow').permissionDecision, 'deny');
+  assert.equal(executeThroughGuard('git send-pack origin refs/heads/task/review-flow').permissionDecision, 'deny');
+  assert.equal(executeThroughGuard('gh pr merge 1 --merge').permissionDecision, 'deny');
+  assert.equal(remoteMutationCount, 0);
+});
+
+test('revision runtime support fails closed when no pre-execution tool guard exists', () => {
+  assert.equal(providerSupportsRevisionToolGuard('copilot'), true);
+  assert.equal(providerSupportsRevisionToolGuard('claude'), true);
+  for (const agentType of ['codex', 'opencode', 'hermes', 'openclaw', 'grok'] as const) {
+    assert.equal(providerSupportsRevisionToolGuard(agentType), false, agentType);
+  }
+});
+
+test('Copilot adapter installs the revision guard even without a worktree', async () => {
+  let capturedConfig: { hooks?: { onPreToolUse?: (input: unknown) => unknown } } | undefined;
+  const sdkSession = { sessionId: 'sdk-session-1' };
+  const provider = new CopilotProvider() as unknown as {
+    client: { createSession: (config: unknown) => Promise<typeof sdkSession> };
+    createSession: CopilotProvider['createSession'];
+  };
+  provider.client = {
+    createSession: async (config: unknown) => {
+      capturedConfig = config as typeof capturedConfig;
+      return sdkSession;
+    },
+  };
+  const denied = resolveRevisionPushPermission(reviewTask(), {
+    revisionId: 'copilot-adapter-revision',
+    feedback: '不要推送。',
+    prUrl: 'https://example.test/pull/1',
+  });
+  await provider.createSession({
+    contextId: 'task-1',
+    workingDirectory: '/workspace/repo',
+    repoPath: '/workspace/repo',
+    systemPrompt: 'test',
+    onEvent: () => {},
+    hooks: {
+      onPreToolUse: (input: unknown) => evaluateRevisionToolUse(
+        input as { toolName?: unknown; toolArgs?: unknown },
+        denied,
+      ),
+    },
+  });
+
+  assert.ok(capturedConfig?.hooks?.onPreToolUse);
+  const decision = capturedConfig.hooks.onPreToolUse({
+    toolName: 'bash',
+    toolArgs: { command: 'git push origin task/review-flow' },
+  }) as { permissionDecision?: string };
+  assert.equal(decision.permissionDecision, 'deny');
+});
+
+test('patched provider adapters wire deny decisions into native pre-execution hooks', async () => {
+  const copilotAdapter = await fsPromises.readFile(
+    path.join(import.meta.dirname, '../../../node_modules/@codewithdan/agent-sdk-core/dist/providers/copilot.js'),
+    'utf8',
+  );
+  const claudeAdapter = await fsPromises.readFile(
+    path.join(import.meta.dirname, '../../../node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js'),
+    'utf8',
+  );
+  assert.match(copilotAdapter, /consumerHooks\?\.onPreToolUse \|\| \(worktreePath && repoPath\)/);
+  assert.match(copilotAdapter, /return changed \? \{ \.\.\.consumerResult, modifiedArgs \} : consumerResult/);
+  assert.match(claudeAdapter, /PreToolUse: \[\{/);
+  assert.match(claudeAdapter, /permissionDecision: result\.permissionDecision/);
+  assert.match(claudeAdapter, /permissionDecisionReason: result\.permissionDecisionReason/);
 });
 
 test('revision policy B: explicit no-push feedback overrides an existing PR', () => {

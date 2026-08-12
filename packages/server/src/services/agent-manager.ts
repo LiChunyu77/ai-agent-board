@@ -95,13 +95,26 @@ function safePromptText(value: string, maxLength: number): string {
 type RevisionOperation = 'push' | 'merge' | 'commit';
 
 function feedbackProhibitsOperation(feedback: string, operation: RevisionOperation): boolean {
-  const englishOperation = operation === 'push'
-    ? 'push(?:ing)?'
-    : operation === 'merge'
-      ? 'merg(?:e|ing)'
-      : 'commit(?:ting)?';
+  if (operation === 'push') {
+    const chinesePush = /(?:(?:不要再|先不要|暂(?:时)?不|不要|不得|禁止|不允许|不能|不可|不可以|不需要|无需|无须|不必|不用|别再|别|切勿|严禁|未授权|没有授权|未经授权)\s*[^。！？\n]{0,20}|不\s*)(?:(?:git\s+)?push|推送|上传(?:到|至)?远程|提交(?:到|至)远程)/i;
+    const chineseKeepLocal = /(?:先|暂时|暂且)?\s*(?:保留|留|保存)\s*[^。！？\n]{0,12}(?:在|到)?\s*本地|(?:只|仅)\s*(?:保留|留|保存|提交)\s*[^。！？\n]{0,12}(?:在|到)?\s*本地/i;
+    const englishPush = /\b(?:do\s+not|don't|dont|never|must\s+not|should\s+not|shouldn't|cannot|can't|cant|no|not\s+allowed\s+to|not\s+authorized\s+to|not\s+permitted\s+to|refrain\s+from)\b[^.!?\n]{0,40}\b(?:git\s+)?push(?:ing)?\b/i;
+    const englishRemote = /\b(?:do\s+not|don't|dont|never|must\s+not|should\s+not|shouldn't|cannot|can't|cant|no)\b[^.!?\n]{0,40}\b(?:upload|publish|send)\b[^.!?\n]{0,24}\bremote\b/i;
+    const englishKeepLocal = /\b(?:keep|leave|remain|stay|store)\b[^.!?\n]{0,24}\b(?:changes?\s+)?local(?:ly)?\b/i;
+    return chinesePush.test(feedback)
+      || chineseKeepLocal.test(feedback)
+      || englishPush.test(feedback)
+      || englishRemote.test(feedback)
+      || englishKeepLocal.test(feedback);
+  }
+
+  const englishOperation = operation === 'merge' ? 'merg(?:e|ing)' : 'commit(?:ting)?';
+  const chineseOperation = operation === 'merge'
+    ? '(?:git\\s+)?merge|合并'
+    // "提交到远程" is a push prohibition, not a local commit prohibition.
+    : '(?:git\\s+)?commit|提交(?![^。！？\\n]{0,8}(?:到|至)远程)';
   const chinese = new RegExp(
-    `(?:不要再|不要|不得|禁止|不允许|不能|不可|不可以|不需要|无需|无须|不必|不用|别再|别|切勿|严禁|未授权|没有授权|未经授权)[^。！？\\n]{0,16}(?:git\\s+)?${operation}`,
+    `(?:不要再|先不要|暂(?:时)?不|不要|不得|禁止|不允许|不能|不可|不可以|不需要|无需|无须|不必|不用|别再|别|切勿|严禁|未授权|没有授权|未经授权)[^。！？\\n]{0,16}(?:${chineseOperation})`,
     'i',
   );
   const english = new RegExp(
@@ -119,6 +132,13 @@ function feedbackAuthorizesMerge(feedback: string): boolean {
 
 export type RevisionPushIntent = 'prohibit' | 'authorize' | 'unspecified';
 
+export interface RevisionPushPermission {
+  allowed: boolean;
+  remote: 'origin';
+  branchName?: string;
+  reason: 'explicitly-prohibited' | 'explicitly-authorized' | 'missing-existing-pr' | 'unspecified';
+}
+
 /** Parse only high-confidence current-round push permission; prohibition always wins. */
 export function resolveRevisionPushIntent(feedback: string): RevisionPushIntent {
   if (feedbackProhibitsOperation(feedback, 'push')) return 'prohibit';
@@ -129,6 +149,110 @@ export function resolveRevisionPushIntent(feedback: string): RevisionPushIntent 
     || /\bpush\b[^.!?\n]{0,24}\b(?:existing|current|same)\s+(?:PR|pull request)\b/i.test(feedback)
     || /\bpush\b[^.!?\n]{0,32}\b(?:including|together with|all)?\b[^.!?\n]{0,24}\b(?:previous|earlier|held)\b/i.test(feedback);
   return chineseAuthorization || englishAuthorization ? 'authorize' : 'unspecified';
+}
+
+/** Resolve the execution permission. Revision pushes are denied unless every allow condition is explicit. */
+export function resolveRevisionPushPermission(task: Task, revision?: AgentRevisionContext): RevisionPushPermission {
+  if (!revision) return { allowed: false, remote: 'origin', reason: 'unspecified' };
+  const intent = resolveRevisionPushIntent(revision.feedback);
+  if (intent === 'prohibit') {
+    return { allowed: false, remote: 'origin', branchName: task.branchName, reason: 'explicitly-prohibited' };
+  }
+  if (intent !== 'authorize') {
+    return { allowed: false, remote: 'origin', branchName: task.branchName, reason: 'unspecified' };
+  }
+  if (!revision.prUrl || !task.branchName) {
+    return { allowed: false, remote: 'origin', branchName: task.branchName, reason: 'missing-existing-pr' };
+  }
+  return { allowed: true, remote: 'origin', branchName: task.branchName, reason: 'explicitly-authorized' };
+}
+
+export interface RevisionToolUseInput {
+  toolName?: unknown;
+  toolArgs?: unknown;
+  [key: string]: unknown;
+}
+
+export interface RevisionToolUseDecision {
+  permissionDecision?: 'allow' | 'deny';
+  permissionDecisionReason?: string;
+  operation?: 'push' | 'force-push' | 'remote-mutation';
+}
+
+const SHELL_TOOL_NAMES = /(?:^|[_-])(?:bash|shell|execute|command|terminal|run)(?:$|[_-])/i;
+
+function readShellCommand(toolArgs: unknown): string | undefined {
+  if (typeof toolArgs === 'string') return toolArgs;
+  if (Array.isArray(toolArgs) && toolArgs.every((item) => typeof item === 'string')) {
+    return toolArgs.join(' ');
+  }
+  if (!toolArgs || typeof toolArgs !== 'object') return undefined;
+  const record = toolArgs as Record<string, unknown>;
+  for (const key of ['command', 'cmd', 'script', 'shell_command', 'input']) {
+    const value = record[key];
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value) && value.every((item) => typeof item === 'string')) return value.join(' ');
+  }
+  return undefined;
+}
+
+function classifyRemoteMutation(command: string): RevisionToolUseDecision['operation'] | undefined {
+  // Normalize harmless quoting around command words so `git "push"` cannot evade the boundary.
+  const normalized = command.replace(/(["'])(git|push|send-pack|receive-pack)\1/gi, '$2');
+  const gitPush = /\b(?:[\w./-]*\/)?git(?:\s+-[A-Za-z]\s+\S+)*\s+push\b/i;
+  if (gitPush.test(normalized)) {
+    return /(?:^|\s)(?:--force(?:-with-lease|-if-includes)?|-f)(?:\s|=|$)|(?:^|\s)\+\S+/i.test(normalized)
+      ? 'force-push'
+      : 'push';
+  }
+  if (/(?:^|\s)(?:[\w./-]*\/)?git\s+(?:send-pack|receive-pack)\b/i.test(normalized)) {
+    return 'remote-mutation';
+  }
+  if (/(?:^|\s)gh\s+pr\s+merge\b/i.test(normalized)) return 'remote-mutation';
+  if (/(?:^|\s)gh\s+api\b[^\n]*(?:\/git\/refs|\/git\/tags|\/merges)(?:\s|$)/i.test(normalized)
+      && /(?:^|\s)(?:-X|--method)\s*(?:POST|PATCH|PUT|DELETE)\b/i.test(normalized)) {
+    return 'remote-mutation';
+  }
+  return undefined;
+}
+
+function isAuthorizedOrdinaryPush(command: string, permission: RevisionPushPermission): boolean {
+  if (!permission.allowed || !permission.branchName) return false;
+  const escapedBranch = permission.branchName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(
+    `^(?:[\\w./-]*/)?git\\s+push\\s+(?:(?:-u|--set-upstream)\\s+)?origin\\s+${escapedBranch}\\s*$`,
+    'i',
+  ).test(command.trim());
+}
+
+/**
+ * Command-level revision push boundary shared by provider adapters. A denied
+ * result is consumed by the SDK before the shell tool executes.
+ */
+export function evaluateRevisionToolUse(
+  input: RevisionToolUseInput,
+  permission: RevisionPushPermission,
+): RevisionToolUseDecision {
+  const toolName = typeof input.toolName === 'string' ? input.toolName : '';
+  if (!SHELL_TOOL_NAMES.test(toolName)) return {};
+  const command = readShellCommand(input.toolArgs);
+  if (!command) return {};
+  const operation = classifyRemoteMutation(command);
+  if (!operation) return {};
+  if (operation === 'push' && isAuthorizedOrdinaryPush(command, permission)) {
+    return { permissionDecision: 'allow', operation };
+  }
+  const reason = operation === 'force-push'
+    ? 'Force-push is not authorized for revision runs.'
+    : operation === 'push'
+      ? 'This revision is not authorized to push, or the push target is not the authorized origin branch.'
+      : 'Equivalent remote Git mutations are not authorized for revision runs.';
+  return { permissionDecision: 'deny', permissionDecisionReason: reason, operation };
+}
+
+/** Providers whose adapters expose a native, pre-execution command hook. */
+export function providerSupportsRevisionToolGuard(agentType: AgentType): boolean {
+  return agentType === 'copilot' || agentType === 'claude';
 }
 
 /** Build a fresh execution prompt; a revision never attempts to resume an old SDK session. */
@@ -156,11 +280,13 @@ export function buildAgentExecutionPrompt(task: Task, revision?: AgentRevisionCo
       ? 'The review feedback prohibits commit, so this revision must also remain local. Do not push or otherwise update any remote branch.'
       : !existingPr
         ? 'No existing pull request is linked to this task. Do not push or create a pull request.'
-        : hasHeldRevisions && !pushAuthorized
-          ? 'This task branch contains revisions whose push is still held. The default existing-PR policy MUST NOT publish them. Complete and commit this revision locally, but do not run git push or update the remote branch. Explicit user authorization is required to release the hold.'
-          : hasHeldRevisions && pushAuthorized
+        : !pushAuthorized
+          ? hasHeldRevisions
+            ? 'This task branch contains revisions whose push is still held. Complete and commit this revision locally, but do not run git push or update the remote branch. Explicit user authorization is required before any local or previously held commits may be published.'
+            : 'Revision push permission is denied by default. Complete and commit this revision locally, but do not run git push or update the remote branch. Explicit user authorization is required before local commits may be published.'
+          : hasHeldRevisions
             ? `The current review feedback explicitly authorizes releasing the existing push hold. After committing, push the complete task branch to the SAME existing pull request with \`git push origin ${branchName}\`, including the previously held revisions. Do not push any other branch.`
-            : `An existing pull request is linked to this task. If no other review-feedback restriction conflicts, you may update that SAME pull request after committing by running \`git push origin ${branchName}\`. Do not push any other branch.`;
+            : `The current review feedback explicitly authorizes an ordinary push to the SAME existing pull request after committing. Run only \`git push origin ${branchName}\`. Do not push any other branch.`;
   const mergeInstructions = mergeProhibited
     ? 'The review feedback explicitly prohibits merge. Do not run git merge or merge the pull request.'
     : feedbackAuthorizesMerge(revision.feedback)
@@ -918,6 +1044,15 @@ export class AgentManager {
       return;
     }
 
+
+    if (options.revision && !providerSupportsRevisionToolGuard(agentType)) {
+      void terminateOnce(
+        'failed',
+        `Agent ${provider.displayName} cannot run a revision safely because its runtime does not expose the required pre-execution push authorization hook.`,
+      );
+      return;
+    }
+
     // Set up worktree if configured
     let worktreePath: string | undefined;
     let worktreePersisted = Promise.resolve();
@@ -966,6 +1101,7 @@ export class AgentManager {
         const workingDirectory = worktreePath || task.repoPath || process.cwd();
         const hasGit = fs.existsSync(path.join(workingDirectory, '.git'));
         const systemPrompt = buildAgentSystemPrompt(task, workingDirectory, worktreePath, hasGit);
+        const revisionPushPermission = resolveRevisionPushPermission(task, options.revision);
 
         // Track file context across tool_execution_start → command_output pairs
         let lastFileEventFile: string | null = null;
@@ -980,6 +1116,28 @@ export class AgentManager {
           workingDirectory,
           repoPath: task.repoPath,
           systemPrompt,
+          ...(options.revision ? {
+            hooks: {
+              onPreToolUse: (input: unknown) => {
+                const hookInput = input && typeof input === 'object'
+                  ? input as RevisionToolUseInput
+                  : {};
+                const decision = evaluateRevisionToolUse(hookInput, revisionPushPermission);
+                if (decision.permissionDecision === 'deny') {
+                  this.emitEvent(task.id, {
+                    id: uuid(), taskId: task.id, type: 'error',
+                    content: `Blocked unauthorized remote Git mutation: ${decision.permissionDecisionReason}`,
+                    timestamp: Date.now(),
+                    metadata: {
+                      command: `revision-push-block:${decision.operation ?? 'unknown'}`,
+                      error: `push-permission:${revisionPushPermission.reason}`,
+                    },
+                  });
+                }
+                return decision;
+              },
+            },
+          } : {}),
           onEvent: (coreEvent: CoreAgentEvent) => {
             const metadata: Record<string, unknown> = { ...coreEvent.metadata };
             let eventType = coreEvent.type;
@@ -1133,7 +1291,8 @@ export class AgentManager {
                 workingDirectory,
                 feedbackProhibitsOperation(options.revision.feedback, 'commit'),
               );
-              pushed = isRevisionCommitOnRemote(task, workingDirectory, commitSha);
+              pushed = revisionPushPermission.allowed
+                && isRevisionCommitOnRemote(task, workingDirectory, commitSha);
             } catch (err: unknown) {
               finalStatus = 'failed';
               finalError = `Revision validation failed: ${errorMessage(err)}`;

@@ -10,7 +10,7 @@ import { errorMessage } from '../utils.js';
 import { getCloneRoot } from '../config.js';
 import type { TaskRepository } from '../repositories/types.js';
 import { broadcast } from '../websocket.js';
-import { resolveRevisionPushIntent, type AgentManager } from '../services/agent-manager.js';
+import { resolveRevisionPushPermission, type AgentManager } from '../services/agent-manager.js';
 
 // ─── Async handler wrapper ──────────────────────────────────────────
 
@@ -610,11 +610,19 @@ export async function startAgentForTask(
         },
         onComplete: async (completion) => {
           const completedAt = Date.now();
-          const pushIntent = resolveRevisionPushIntent(activeRevision.feedback);
-          const pushed = completion.status === 'complete' && completion.pushed;
+          const pushPermission = resolveRevisionPushPermission(updated, {
+            revisionId: activeRevision.id,
+            feedback: activeRevision.feedback,
+            previousSummary: activeRevision.previousSummary,
+            prUrl: updated.prUrl ?? undefined,
+            hasHeldRevisions,
+          });
+          const pushed = completion.status === 'complete'
+            && completion.pushed
+            && pushPermission.allowed;
           const pushStatus = pushed
             ? 'pushed'
-            : completion.status === 'complete' && completion.commitSha && pushIntent === 'prohibit'
+            : completion.status === 'complete' && completion.commitSha && !pushPermission.allowed
               ? 'held'
               : 'local';
           await repo.finalizeRevision(activeRevision.id, {
@@ -624,7 +632,7 @@ export async function startAgentForTask(
             commitSha: completion.commitSha ?? null,
             pushStatus,
             pushedAt: pushed ? completedAt : undefined,
-            releaseHeldRevisions: pushed && hasHeldRevisions && pushIntent === 'authorize',
+            releaseHeldRevisions: pushed && hasHeldRevisions && pushPermission.allowed,
           });
         },
       } : undefined,

@@ -1,20 +1,76 @@
+diff --git a/node_modules/@codewithdan/agent-sdk-core/dist/providers/copilot.js b/node_modules/@codewithdan/agent-sdk-core/dist/providers/copilot.js
+index d7b3423..4c560fb 100644
+--- a/node_modules/@codewithdan/agent-sdk-core/dist/providers/copilot.js
++++ b/node_modules/@codewithdan/agent-sdk-core/dist/providers/copilot.js
+@@ -65,23 +65,25 @@ export class CopilotProvider {
+             : undefined;
+         // Build hooks: merge worktree path rewriting with consumer-provided hooks
+         const consumerHooks = config.hooks;
+-        const hooks = worktreePath && repoPath
++        const hooks = consumerHooks?.onPreToolUse || (worktreePath && repoPath)
+             ? {
+                 onPreToolUse: ((input) => {
+                     const workingDirectory = isObject(input) && typeof input.workingDirectory === 'string'
+                         ? input.workingDirectory
+                         : config.workingDirectory;
+                     const hookInput = { ...input, cwd: workingDirectory };
++                    let consumerResult = {};
+                     // Consumer hook first
+                     if (consumerHooks?.onPreToolUse) {
+                         const result = consumerHooks.onPreToolUse(hookInput);
+                         if (result && typeof result === 'object') {
++                            consumerResult = result;
+                             Object.assign(hookInput, result);
+                         }
+                     }
+                     // Then worktree path rewriting
+-                    if (!hookInput.toolArgs || typeof hookInput.toolArgs !== 'object')
+-                        return {};
++                    if (!worktreePath || !repoPath || !hookInput.toolArgs || typeof hookInput.toolArgs !== 'object')
++                        return consumerResult;
+                     const args = hookInput.toolArgs;
+                     let changed = false;
+                     function rewriteValue(val) {
+@@ -110,7 +112,7 @@ export class CopilotProvider {
+                     for (const [key, value] of Object.entries(args)) {
+                         modifiedArgs[key] = rewriteValue(value);
+                     }
+-                    return changed ? { modifiedArgs } : {};
++                    return changed ? { ...consumerResult, modifiedArgs } : consumerResult;
+                 }),
+             }
+             : undefined;
 diff --git a/node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js b/node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js
-index 067243f..d2627e2 100644
+index d2627e2..f5ec29f 100644
 --- a/node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js
 +++ b/node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js
-@@ -89,6 +89,15 @@ export class ClaudeProvider {
-                     ...(model ? { model } : {}),
+@@ -90,5 +90,29 @@ export class ClaudeProvider {
                      cwd: config.workingDirectory,
                      permissionMode,
-+                    settingSources: ['user', 'project', 'local'],
-+                    mcpServers: {
-+                        playwright: {
-+                            type: 'stdio',
-+                            command: 'npx',
-+                            args: ['@playwright/mcp@latest'],
-+                            alwaysLoad: true,
+                     settingSources: ['user', 'project', 'local'],
++                    ...(config.hooks?.onPreToolUse ? {
++                        hooks: {
++                            PreToolUse: [{
++                                hooks: [async (input) => {
++                                    const result = await config.hooks.onPreToolUse({
++                                        toolName: input.tool_name,
++                                        toolArgs: input.tool_input,
++                                        workingDirectory: config.workingDirectory,
++                                    });
++                                    if (!result || typeof result !== 'object')
++                                        return {};
++                                    return {
++                                        hookSpecificOutput: {
++                                            hookEventName: 'PreToolUse',
++                                            ...(result.permissionDecision ? { permissionDecision: result.permissionDecision } : {}),
++                                            ...(result.permissionDecisionReason ? { permissionDecisionReason: result.permissionDecisionReason } : {}),
++                                            ...(result.modifiedArgs ? { updatedInput: result.modifiedArgs } : {}),
++                                            ...(result.additionalContext ? { additionalContext: result.additionalContext } : {}),
++                                        },
++                                    };
++                                }],
++                            }],
 +                        },
-+                    },
-                     systemPrompt: config.systemPrompt,
-                     ...(sessionId ? { resume: sessionId } : {}),
-                     ...(spawnFn ? { spawnClaudeCodeProcess: spawnFn } : {}),
++                    } : {}),
+                     mcpServers: {
+                         playwright: {
