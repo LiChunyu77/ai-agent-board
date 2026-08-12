@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
-import type { Task, Priority, ColumnId, AgentStatus, AgentType, AgentEvent } from '../types.js';
-import type { TaskRepository } from './types.js';
+import type { Task, Priority, ColumnId, AgentStatus, AgentType, AgentEvent, TaskRevision, TaskRevisionStatus, TaskRevisionPushStatus } from '../types.js';
+import type { BeginTaskRevisionInput, FinalizeTaskRevisionInput, TaskRepository, TaskRevisionUpdates } from './types.js';
 import { errorMessage } from '../utils.js';
 
 interface TaskRow {
@@ -27,6 +27,24 @@ interface TaskRow {
   external_source: string | null; external_key: string | null; provenance: string | null;
   run_requested_at: number | null; run_claimed_at: number | null;
   timeout_minutes: number | null;
+  pr_url: string | null;
+}
+
+interface TaskRevisionRow {
+  id: string;
+  task_id: string;
+  revision_number: number;
+  feedback: string;
+  status: TaskRevisionStatus;
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+  previous_summary: string | null;
+  agent_summary: string | null;
+  commit_sha: string | null;
+  push_status: TaskRevisionPushStatus | undefined;
+  pushed_at: number | null | undefined;
+  released_by_revision_id: string | null | undefined;
 }
 
 function rowToTask(row: TaskRow): Task {
@@ -55,6 +73,26 @@ function rowToTask(row: TaskRow): Task {
     provenance: row.provenance ? JSON.parse(row.provenance) : undefined,
     runRequestedAt: row.run_requested_at ?? undefined, runClaimedAt: row.run_claimed_at ?? undefined,
     timeoutMinutes: row.timeout_minutes ?? undefined,
+    prUrl: row.pr_url ?? null,
+  };
+}
+
+function rowToRevision(row: TaskRevisionRow): TaskRevision {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    revisionNumber: row.revision_number,
+    feedback: row.feedback,
+    status: row.status,
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? undefined,
+    completedAt: row.completed_at ?? undefined,
+    previousSummary: row.previous_summary,
+    agentSummary: row.agent_summary,
+    commitSha: row.commit_sha,
+    pushStatus: row.push_status ?? 'local',
+    pushedAt: row.pushed_at ?? undefined,
+    releasedByRevisionId: row.released_by_revision_id ?? null,
   };
 }
 
@@ -83,9 +121,9 @@ export class SqliteTaskRepository implements TaskRepository {
       getById: db.prepare('SELECT * FROM tasks WHERE id = ?'),
       insert: db.prepare(`
         INSERT INTO tasks (id, project_id, title, description, priority, column_id, agent_status, agent_type, created_at, started_at, completed_at,
-          repo_path, branch_name, base_branch, use_worktree, worktree_path, archived, group_id, group_order, summary, external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes)
+          repo_path, branch_name, base_branch, use_worktree, worktree_path, archived, group_id, group_order, summary, external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes, pr_url)
         VALUES (@id, @project_id, @title, @description, @priority, @column_id, @agent_status, @agent_type, @created_at, @started_at, @completed_at,
-          @repo_path, @branch_name, @base_branch, @use_worktree, @worktree_path, @archived, @group_id, @group_order, @summary, @external_source, @external_key, @provenance, @run_requested_at, @run_claimed_at, @timeout_minutes)
+          @repo_path, @branch_name, @base_branch, @use_worktree, @worktree_path, @archived, @group_id, @group_order, @summary, @external_source, @external_key, @provenance, @run_requested_at, @run_claimed_at, @timeout_minutes, @pr_url)
       `),
       update: db.prepare(`
         UPDATE tasks SET
@@ -104,7 +142,8 @@ export class SqliteTaskRepository implements TaskRepository {
           worktree_path = @worktree_path,
           archived = @archived,
           summary = @summary, run_requested_at = @run_requested_at, run_claimed_at = @run_claimed_at,
-          timeout_minutes = @timeout_minutes
+          timeout_minutes = @timeout_minutes,
+          pr_url = @pr_url
         WHERE id = @id
       `),
       delete: db.prepare('DELETE FROM tasks WHERE id = ?'),
@@ -157,6 +196,7 @@ export class SqliteTaskRepository implements TaskRepository {
       summary: task.summary ?? null, external_source: task.externalSource ?? null, external_key: task.externalKey ?? null,
       provenance: task.provenance ? JSON.stringify(task.provenance) : null, run_requested_at: task.runRequestedAt ?? null, run_claimed_at: task.runClaimedAt ?? null,
       timeout_minutes: task.timeoutMinutes ?? null,
+      pr_url: task.prUrl ?? null,
     });
     return task;
   }
@@ -197,6 +237,7 @@ export class SqliteTaskRepository implements TaskRepository {
         archived: merged.archived ? 1 : 0,
         summary: merged.summary ?? null, run_requested_at: merged.runRequestedAt ?? null, run_claimed_at: merged.runClaimedAt ?? null,
         timeout_minutes: merged.timeoutMinutes ?? null,
+        pr_url: merged.prUrl ?? null,
       });
       return merged;
     })();
@@ -259,5 +300,124 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async getArchivedTasks(projectId = 'default'): Promise<Task[]> {
     return (this.stmts.getArchived.all(projectId) as TaskRow[]).map(rowToTask);
+  }
+
+  async beginRevision(input: BeginTaskRevisionInput): Promise<{ task: Task; revision: TaskRevision } | undefined> {
+    return this.db.transaction(() => {
+      const taskRow = this.stmts.getById.get(input.taskId) as TaskRow | undefined;
+      if (!taskRow || taskRow.column_id !== 'review') return undefined;
+
+      const next = this.db.prepare(
+        'SELECT COALESCE(MAX(revision_number), 0) + 1 AS revision_number FROM task_revisions WHERE task_id = ?',
+      ).get(input.taskId) as { revision_number: number };
+      this.db.prepare(`
+        INSERT INTO task_revisions (
+          id, task_id, revision_number, feedback, status, created_at,
+          started_at, completed_at, previous_summary, agent_summary, commit_sha,
+          push_status, pushed_at, released_by_revision_id
+        ) VALUES (?, ?, ?, ?, 'pending', ?, NULL, NULL, ?, NULL, NULL, 'local', NULL, NULL)
+      `).run(input.id, input.taskId, next.revision_number, input.feedback, input.createdAt, taskRow.summary);
+
+      this.db.prepare(`
+        UPDATE tasks SET
+          column_id = 'in-progress', agent_status = 'planning',
+          started_at = ?, completed_at = NULL,
+          run_requested_at = ?, run_claimed_at = NULL
+        WHERE id = ?
+      `).run(input.createdAt, input.createdAt, input.taskId);
+
+      const updatedTask = this.stmts.getById.get(input.taskId) as TaskRow;
+      const revisionRow = this.db.prepare('SELECT * FROM task_revisions WHERE id = ?').get(input.id) as TaskRevisionRow;
+      return { task: rowToTask(updatedTask), revision: rowToRevision(revisionRow) };
+    })();
+  }
+
+  async getRevisionsByTaskId(taskId: string): Promise<TaskRevision[]> {
+    const rows = this.db.prepare(`
+      SELECT * FROM task_revisions
+      WHERE task_id = ?
+      ORDER BY revision_number ASC, created_at ASC, id ASC
+    `).all(taskId) as TaskRevisionRow[];
+    return rows.map(rowToRevision);
+  }
+
+  async getActiveRevisionByTaskId(taskId: string): Promise<TaskRevision | undefined> {
+    const row = this.db.prepare(`
+      SELECT * FROM task_revisions
+      WHERE task_id = ? AND status IN ('pending', 'in-progress')
+      ORDER BY revision_number DESC
+      LIMIT 1
+    `).get(taskId) as TaskRevisionRow | undefined;
+    return row ? rowToRevision(row) : undefined;
+  }
+
+  async hasHeldRevisions(taskId: string): Promise<boolean> {
+    const row = this.db.prepare(`
+      SELECT 1 FROM task_revisions
+      WHERE task_id = ? AND push_status = 'held'
+      LIMIT 1
+    `).get(taskId);
+    return Boolean(row);
+  }
+
+  async updateRevision(id: string, updates: TaskRevisionUpdates): Promise<TaskRevision | undefined> {
+    return this.db.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM task_revisions WHERE id = ?').get(id) as TaskRevisionRow | undefined;
+      if (!row) return undefined;
+      const existing = rowToRevision(row);
+      const merged = { ...existing, ...updates };
+      this.db.prepare(`
+        UPDATE task_revisions SET
+          status = ?, started_at = ?, completed_at = ?, agent_summary = ?, commit_sha = ?,
+          push_status = ?, pushed_at = ?, released_by_revision_id = ?
+        WHERE id = ?
+      `).run(
+        merged.status,
+        merged.startedAt ?? null,
+        merged.completedAt ?? null,
+        merged.agentSummary ?? null,
+        merged.commitSha ?? null,
+        merged.pushStatus,
+        merged.pushedAt ?? null,
+        merged.releasedByRevisionId ?? null,
+        id,
+      );
+      const updated = this.db.prepare('SELECT * FROM task_revisions WHERE id = ?').get(id) as TaskRevisionRow;
+      return rowToRevision(updated);
+    })();
+  }
+
+  async finalizeRevision(id: string, input: FinalizeTaskRevisionInput): Promise<TaskRevision | undefined> {
+    return this.db.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM task_revisions WHERE id = ?').get(id) as TaskRevisionRow | undefined;
+      if (!row) return undefined;
+      if (input.releaseHeldRevisions) {
+        this.db.prepare(`
+          UPDATE task_revisions SET
+            push_status = 'released', pushed_at = ?, released_by_revision_id = ?
+          WHERE task_id = ? AND id <> ? AND push_status = 'held'
+        `).run(input.pushedAt ?? input.completedAt, id, row.task_id, id);
+        this.db.prepare(`
+          UPDATE task_revisions SET push_status = 'pushed', pushed_at = ?
+          WHERE task_id = ? AND id <> ? AND push_status = 'local' AND commit_sha IS NOT NULL
+        `).run(input.pushedAt ?? input.completedAt, row.task_id, id);
+      }
+      this.db.prepare(`
+        UPDATE task_revisions SET
+          status = ?, completed_at = ?, agent_summary = ?, commit_sha = ?,
+          push_status = ?, pushed_at = ?, released_by_revision_id = NULL
+        WHERE id = ?
+      `).run(
+        input.status,
+        input.completedAt,
+        input.agentSummary,
+        input.commitSha,
+        input.pushStatus,
+        input.pushedAt ?? null,
+        id,
+      );
+      const updated = this.db.prepare('SELECT * FROM task_revisions WHERE id = ?').get(id) as TaskRevisionRow;
+      return rowToRevision(updated);
+    })();
   }
 }

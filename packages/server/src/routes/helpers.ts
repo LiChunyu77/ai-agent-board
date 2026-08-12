@@ -10,7 +10,7 @@ import { errorMessage } from '../utils.js';
 import { getCloneRoot } from '../config.js';
 import type { TaskRepository } from '../repositories/types.js';
 import { broadcast } from '../websocket.js';
-import type { AgentManager } from '../services/agent-manager.js';
+import { resolveRevisionPushIntent, type AgentManager } from '../services/agent-manager.js';
 
 // ─── Async handler wrapper ──────────────────────────────────────────
 
@@ -572,6 +572,9 @@ export async function startAgentForTask(
   const claimed = await repo.claimRun(task.id, Date.now());
   if (!claimed) return;
   task = claimed;
+  // A durable revision row is the execution context after a restart; ordinary runs have none.
+  const activeRevision = await repo.getActiveRevisionByTaskId(task.id);
+  const hasHeldRevisions = activeRevision ? await repo.hasHeldRevisions(task.id) : false;
   const updates: Partial<Task> = {
     agentStatus: 'planning',
     startedAt: Date.now(),
@@ -587,10 +590,44 @@ export async function startAgentForTask(
     agentManager.startAgent(
       updated,
       async (status) => {
+        if (activeRevision && status === 'executing') {
+          await repo.updateRevision(activeRevision.id, {
+            status: 'in-progress',
+            startedAt: activeRevision.startedAt ?? Date.now(),
+          });
+        }
         if (status === 'complete' || status === 'failed') await repo.clearRun(task.id);
         await onStatusChange(status);
       },
       makeWorktreeCallback(repo, task.id),
+      activeRevision ? {
+        revision: {
+          revisionId: activeRevision.id,
+          feedback: activeRevision.feedback,
+          previousSummary: activeRevision.previousSummary,
+          prUrl: updated.prUrl ?? undefined,
+          hasHeldRevisions,
+        },
+        onComplete: async (completion) => {
+          const completedAt = Date.now();
+          const pushIntent = resolveRevisionPushIntent(activeRevision.feedback);
+          const pushed = completion.status === 'complete' && completion.pushed;
+          const pushStatus = pushed
+            ? 'pushed'
+            : completion.status === 'complete' && completion.commitSha && pushIntent === 'prohibit'
+              ? 'held'
+              : 'local';
+          await repo.finalizeRevision(activeRevision.id, {
+            status: completion.status,
+            completedAt,
+            agentSummary: completion.agentSummary,
+            commitSha: completion.commitSha ?? null,
+            pushStatus,
+            pushedAt: pushed ? completedAt : undefined,
+            releaseHeldRevisions: pushed && hasHeldRevisions && pushIntent === 'authorize',
+          });
+        },
+      } : undefined,
     );
   }
 }

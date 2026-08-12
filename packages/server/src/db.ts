@@ -8,7 +8,7 @@ import fs from 'fs';
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'agentboard.db');
 const DATA_DIR = path.dirname(DB_PATH);
 
-function migrate(db: Database.Database): void {
+export function migrateSqliteDatabase(db: Database.Database): void {
   const now = Date.now();
 
   db.exec(`
@@ -59,7 +59,8 @@ function migrate(db: Database.Database): void {
       created_at    INTEGER NOT NULL,
       started_at    INTEGER,
       completed_at  INTEGER,
-      summary       TEXT
+      summary       TEXT,
+      pr_url        TEXT
     )
   `);
 
@@ -148,6 +149,7 @@ function migrate(db: Database.Database): void {
   if (!colNames.has('run_requested_at')) db.exec(`ALTER TABLE tasks ADD COLUMN run_requested_at INTEGER`);
   if (!colNames.has('run_claimed_at')) db.exec(`ALTER TABLE tasks ADD COLUMN run_claimed_at INTEGER`);
   if (!colNames.has('timeout_minutes')) db.exec(`ALTER TABLE tasks ADD COLUMN timeout_minutes INTEGER`);
+  if (!colNames.has('pr_url')) db.exec(`ALTER TABLE tasks ADD COLUMN pr_url TEXT`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_external_identity ON tasks(external_source, external_key) WHERE external_source IS NOT NULL AND external_key IS NOT NULL`);
 
   // Task groups table
@@ -211,6 +213,43 @@ function migrate(db: Database.Database): void {
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_task_attachments_task_id ON task_attachments(task_id)`);
+
+  // Append-only review rounds; deleting a task removes its associated history.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS task_revisions (
+      id               TEXT PRIMARY KEY,
+      task_id          TEXT NOT NULL,
+      revision_number  INTEGER NOT NULL,
+      feedback         TEXT NOT NULL,
+      status           TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'in-progress', 'complete', 'failed')),
+      created_at       INTEGER NOT NULL,
+      started_at       INTEGER,
+      completed_at     INTEGER,
+      previous_summary TEXT,
+      agent_summary    TEXT,
+      commit_sha       TEXT,
+      push_status      TEXT NOT NULL DEFAULT 'local'
+        CHECK (push_status IN ('local', 'held', 'pushed', 'released')),
+      pushed_at        INTEGER,
+      released_by_revision_id TEXT,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+      UNIQUE (task_id, revision_number)
+    )
+  `);
+  const revisionCols = db.pragma('table_info(task_revisions)') as { name: string }[];
+  const revisionColNames = new Set(revisionCols.map((column) => column.name));
+  if (!revisionColNames.has('push_status')) {
+    db.exec(`ALTER TABLE task_revisions ADD COLUMN push_status TEXT NOT NULL DEFAULT 'local'`);
+  }
+  if (!revisionColNames.has('pushed_at')) {
+    db.exec(`ALTER TABLE task_revisions ADD COLUMN pushed_at INTEGER`);
+  }
+  if (!revisionColNames.has('released_by_revision_id')) {
+    db.exec(`ALTER TABLE task_revisions ADD COLUMN released_by_revision_id TEXT`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_task_revisions_task_number ON task_revisions(task_id, revision_number ASC)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_task_revisions_held ON task_revisions(task_id, push_status) WHERE push_status = 'held'`);
 }
 
 function hasSqliteForeignKey(
@@ -304,6 +343,7 @@ function ensureSqliteProjectForeignKeys(db: Database.Database): void {
         run_requested_at INTEGER,
         run_claimed_at INTEGER,
         timeout_minutes INTEGER,
+        pr_url TEXT,
         FOREIGN KEY (project_id) REFERENCES projects(id),
         FOREIGN KEY (group_id) REFERENCES task_groups(id) ON DELETE CASCADE
       );
@@ -312,13 +352,13 @@ function ensureSqliteProjectForeignKeys(db: Database.Database): void {
         id, title, description, priority, column_id, agent_status, created_at,
         started_at, completed_at, repo_path, branch_name, base_branch, use_worktree,
         worktree_path, agent_type, archived, project_id, group_id, group_order, summary,
-        external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes
+        external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes, pr_url
       )
       SELECT
         id, title, description, priority, column_id, agent_status, created_at,
         started_at, completed_at, repo_path, branch_name, base_branch, use_worktree,
         worktree_path, agent_type, archived, project_id, group_id, group_order, summary,
-        external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes
+        external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes, pr_url
       FROM tasks;
 
       DROP TABLE tasks;
@@ -347,7 +387,7 @@ export function initDatabase(): Database.Database {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 10000'); // wait up to 10s on lock contention
-  migrate(db);
+  migrateSqliteDatabase(db);
   console.log(`[db] initialized at ${DB_PATH}`);
   return db;
 }
@@ -411,7 +451,8 @@ export async function initPostgresDatabase(pool: Pool): Promise<void> {
       agent_type    TEXT NOT NULL DEFAULT 'copilot',
       archived      BOOLEAN NOT NULL DEFAULT FALSE,
       project_id    TEXT NOT NULL DEFAULT 'default',
-      timeout_minutes INTEGER
+      timeout_minutes INTEGER,
+      pr_url        TEXT
     )
   `);
 
@@ -442,6 +483,7 @@ export async function initPostgresDatabase(pool: Pool): Promise<void> {
   await addCol('run_requested_at', 'BIGINT');
   await addCol('run_claimed_at', 'BIGINT');
   await addCol('timeout_minutes', 'INTEGER');
+  await addCol('pr_url', 'TEXT');
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_external_identity ON tasks(external_source, external_key) WHERE external_source IS NOT NULL AND external_key IS NOT NULL`);
 
   // Task groups table
@@ -566,6 +608,41 @@ export async function initPostgresDatabase(pool: Pool): Promise<void> {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_task_attachments_task_id ON task_attachments(task_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS task_revisions (
+      id               TEXT PRIMARY KEY,
+      task_id          TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      revision_number  INTEGER NOT NULL,
+      feedback         TEXT NOT NULL,
+      status           TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'in-progress', 'complete', 'failed')),
+      created_at       BIGINT NOT NULL,
+      started_at       BIGINT,
+      completed_at     BIGINT,
+      previous_summary TEXT,
+      agent_summary    TEXT,
+      commit_sha       TEXT,
+      push_status      TEXT NOT NULL DEFAULT 'local'
+        CHECK (push_status IN ('local', 'held', 'pushed', 'released')),
+      pushed_at        BIGINT,
+      released_by_revision_id TEXT,
+      UNIQUE (task_id, revision_number)
+    )
+  `);
+  await pool.query(`ALTER TABLE task_revisions ADD COLUMN IF NOT EXISTS push_status TEXT NOT NULL DEFAULT 'local'`);
+  await pool.query(`ALTER TABLE task_revisions ADD COLUMN IF NOT EXISTS pushed_at BIGINT`);
+  await pool.query(`ALTER TABLE task_revisions ADD COLUMN IF NOT EXISTS released_by_revision_id TEXT`);
+  await pool.query(`
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'task_revisions_push_status_check') THEN
+        ALTER TABLE task_revisions ADD CONSTRAINT task_revisions_push_status_check
+          CHECK (push_status IN ('local', 'held', 'pushed', 'released'));
+      END IF;
+    END $$
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_task_revisions_task_number ON task_revisions(task_id, revision_number ASC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_task_revisions_held ON task_revisions(task_id, push_status) WHERE push_status = 'held'`);
 
   // Migrate existing FK to ON DELETE CASCADE if not already set
   const { rows: fkRows } = await pool.query(`

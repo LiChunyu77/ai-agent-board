@@ -156,6 +156,17 @@ export function useTasks(projectId = 'default') {
     }
   }, []);
 
+  const requestChanges = useCallback(async (id: string, feedback: string) => {
+    try {
+      const result = await api.requestChanges(id, feedback);
+      setTasks((prev) => prev.map((task) => (task.id === id ? result.task : task)));
+      return result;
+    } catch (err) {
+      setError(`Failed to request changes: ${(err as Error).message}`);
+      return undefined;
+    }
+  }, []);
+
   const updateTask = useCallback(async (id: string, updates: Partial<Task>) => {
     try {
       const updated = await api.updateTask(id, updates);
@@ -196,5 +207,5 @@ export function useTasks(projectId = 'default') {
 
   const clearError = useCallback(() => setError(null), []);
 
-  return { tasks, error, clearError, showArchived, setShowArchived, addTask, updateTask, moveTask, runTask, stopTask, deleteTask, archiveTask, unarchiveTask, configureAndRunTask, createPR, mergeLocal, cleanupWorktree };
+  return { tasks, error, clearError, showArchived, setShowArchived, addTask, updateTask, moveTask, runTask, stopTask, requestChanges, deleteTask, archiveTask, unarchiveTask, configureAndRunTask, createPR, mergeLocal, cleanupWorktree };
 }

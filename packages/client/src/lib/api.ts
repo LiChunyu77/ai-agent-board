@@ -2,6 +2,8 @@ import type {
   Task,
   TaskGroup,
   TaskAttachment,
+  TaskRevision,
+  RequestChangesResponse,
   AgentEvent,
   AgentInfo,
   AgentType,
@@ -114,6 +116,15 @@ export const api = {
 
   getEvents: (id: string) =>
     request<AgentEvent[]>(`/tasks/${id}/events`),
+
+  getRevisions: (id: string) =>
+    request<TaskRevision[]>(`/tasks/${id}/revisions`),
+
+  requestChanges: (id: string, feedback: string) =>
+    request<RequestChangesResponse>(`/tasks/${id}/request-changes`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    }),
 
   getAgents: () => request<AgentInfo[]>('/agents'),
 
@@ -237,9 +248,17 @@ function ensureConnection() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  let url = `${proto}//${location.host}/ws`;
+  const configuredUrl = (import.meta.env.VITE_WS_URL as string | undefined)?.trim();
+  // Local Vite development runs on 8081 while the API server listens on 8080.
+  // Other ports (including E2E) and production deployments use the Vite/nginx
+  // same-origin /ws proxy unless an explicit endpoint is configured.
+  let url = configuredUrl
+    || (location.port === '8081'
+      ? `${proto}//${location.hostname}:8080/ws`
+      : `${proto}//${location.host}/ws`);
   if (API_KEY) {
-    url += `?token=${encodeURIComponent(API_KEY)}`;
+    const separator = url.includes('?') ? '&' : '?';
+    url += `${separator}token=${encodeURIComponent(API_KEY)}`;
   }
   disposed = false;
   setConnectionStatus('connecting');

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';import Markdown from 'react-markdown';
+import { motion, AnimatePresence } from 'framer-motion';
+import Markdown from 'react-markdown';
 import {
   X,
   Brain,
@@ -18,13 +19,11 @@ import {
   ExternalLink,
   GitMerge,
   Trash2,
-  Send,
   FileText,
   RotateCw,
   Download,
-  Paperclip,
 } from 'lucide-react';
-import type { Task, AgentEvent, AgentEventType } from '@/types';
+import type { Task, TaskRevision, RequestChangesResponse, AgentEvent, AgentEventType } from '@/types';
 import { getAgentDisplay } from '@/lib/agent-config';
 import { TerminalView } from './TerminalView';
 import { api, connectWS } from '@/lib/api';
@@ -218,12 +217,15 @@ interface AgentPanelProps {
   onClose: () => void;
   onRun?: (id: string) => void;
   onStop?: (id: string) => void;
+  onRequestChanges?: (id: string, feedback: string) => Promise<RequestChangesResponse | undefined>;
   onCreatePR?: (id: string) => Promise<string | undefined>;
   onMergeLocal?: (id: string) => Promise<string | undefined>;
   onCleanupWorktree?: (id: string) => Promise<void>;
   onReconfigureRetry?: (id: string) => void;
   theme?: 'dark' | 'light';
 }
+
+type AgentPanelTab = 'summary' | 'events' | 'terminal' | 'changes' | 'revisions';
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -427,7 +429,7 @@ function EventItem({ event }: { event: CoalescedEvent }) {
   );
 }
 
-export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLocal, onCleanupWorktree, onReconfigureRetry, theme }: AgentPanelProps) {
+export function AgentPanel({ task, onClose, onRun, onStop, onRequestChanges, onCreatePR, onMergeLocal, onCleanupWorktree, onReconfigureRetry, theme }: AgentPanelProps) {
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [prUrl, setPrUrl] = useState<string | null>(null);
@@ -436,12 +438,14 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
   const [mergeResult, setMergeResult] = useState<string | null>(null);
   const [mergeLoading, setMergeLoading] = useState(false);
   const [mergeError, setMergeError] = useState<string | null>(null);
-  const [followUpMessage, setFollowUpMessage] = useState('');
-  const [sending, setSending] = useState(false);
-  const [followUpImages, setFollowUpImages] = useState<File[]>([]);
-  const imageInputRef = useRef<HTMLInputElement>(null);
+  const [revisions, setRevisions] = useState<TaskRevision[]>([]);
+  const [revisionsLoading, setRevisionsLoading] = useState(false);
+  const [revisionsError, setRevisionsError] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState('');
+  const [requestingChanges, setRequestingChanges] = useState(false);
+  const [requestChangesError, setRequestChangesError] = useState<string | null>(null);
   const [descExpanded, setDescExpanded] = useState(false);
-  const [activeTab, setActiveTab] = useState<'summary' | 'events' | 'terminal' | 'changes'>('events');
+  const [activeTab, setActiveTab] = useState<AgentPanelTab>('events');
   // Tracks whether the user manually picked a tab for the current task, so the
   // auto-default (Summary for review/done) doesn't clobber an explicit choice.
   const userSelectedTabRef = useRef(false);
@@ -452,6 +456,7 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
 
   const taskId = task?.id ?? null;
   const agentStatus = task?.agentStatus;
+  const columnId = task?.columnId;
   const errorEvents = useMemo(() => events.filter((event) => event.type === 'error'), [events]);
   const latestError = errorEvents[errorEvents.length - 1];
 
@@ -464,7 +469,7 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
     }
 
     // Reset state for new task
-    setPrUrl(null);
+    setPrUrl(task?.prUrl ?? null);
     setPrLoading(false);
     setPrError(null);
     setMergeResult(null);
@@ -472,9 +477,9 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
     setMergeError(null);
     setShowWorktreeConfirm(false);
     setHasRemote(null);
-    setFollowUpMessage('');
-    setSending(false);
-    setFollowUpImages([]);
+    setFeedback('');
+    setRequestingChanges(false);
+    setRequestChangesError(null);
     // Allow the auto-default tab to apply for the newly selected task
     userSelectedTabRef.current = false;
 
@@ -498,27 +503,37 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
           }
         }
       }
-      // Show follow-up messages from other clients (dedup against local sends)
-      if (msg.type === 'agent_follow_up' && msg.payload.taskId === taskId) {
-        const content = `You: ${msg.payload.message}`;
-        setEvents((prev) => {
-          // Skip if we already added this message locally
-          if (prev.some((e) => e.type === 'command' && e.content === content)) return prev;
-          return [...prev, {
-            id: `fu-ws-${Date.now()}`,
-            taskId: taskId,
-            type: 'command' as const,
-            content,
-            timestamp: Date.now(),
-          }];
-        });
-      }
     });
 
     return () => {
       disconnect();
       setStreaming(false);
     };
+  }, [taskId]);
+
+  useEffect(() => {
+    if (!taskId) {
+      setRevisions([]);
+      setRevisionsLoading(false);
+      setRevisionsError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setRevisionsLoading(true);
+    setRevisionsError(null);
+    api.getRevisions(taskId)
+      .then((loaded) => {
+        if (!cancelled) setRevisions(loaded);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setRevisionsError(err.message || '无法加载修改记录');
+      })
+      .finally(() => {
+        if (!cancelled) setRevisionsLoading(false);
+      });
+
+    return () => { cancelled = true; };
   }, [taskId]);
 
   // Fix #4: Sync streaming state with agentStatus (avoids stale closure on [taskId] effect)
@@ -530,16 +545,19 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
 
   // Default to the Summary tab for review/done tasks (and auto-switch when a task
   // moves into review on completion), unless the user picked a tab themselves.
-  const columnId = task?.columnId;
   useEffect(() => {
     if (!taskId) return;
+    if (columnId !== 'review' && columnId !== 'done' && activeTab === 'summary') {
+      setActiveTab('events');
+      return;
+    }
     if (userSelectedTabRef.current) return;
     if (columnId === 'review' || columnId === 'done') {
       setActiveTab('summary');
     } else {
       setActiveTab('events');
     }
-  }, [taskId, columnId]);
+  }, [taskId, columnId, activeTab]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -550,12 +568,14 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
 
   const isActive = task?.agentStatus === 'executing' || task?.agentStatus === 'planning';
 
-  const selectTab = (tab: 'summary' | 'events' | 'terminal' | 'changes') => {
+  const selectTab = (tab: AgentPanelTab) => {
     userSelectedTabRef.current = true;
     setActiveTab(tab);
   };
   const showSummaryTab = columnId === 'review' || columnId === 'done';
   const summaryText = task?.summary ?? null;
+  const displayedPrUrl = task?.prUrl ?? prUrl;
+  const hasHeldRevisions = revisions.some((revision) => revision.pushStatus === 'held');
   // The "Completed" section is required; flag when it's missing or empty.
   const completedSectionFilled = useMemo(() => {
     if (!summaryText) return false;
@@ -595,35 +615,27 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
 
   const failedWithoutDetails = task?.agentStatus === 'failed' && !latestError;
 
-  const handleSendFollowUp = async () => {
-    if (!task || (!followUpMessage.trim() && followUpImages.length === 0) || sending) return;
-    const message = followUpMessage.trim();
-    setSending(true);
-    setFollowUpMessage('');
-    const imagesToUpload = [...followUpImages];
-    setFollowUpImages([]);
-
-    // Show locally immediately
-    const imageNote = imagesToUpload.length > 0 ? ` [+${imagesToUpload.length} image${imagesToUpload.length > 1 ? 's' : ''}]` : '';
-    setEvents((prev) => [...prev, {
-      id: `fu-${Date.now()}`,
-      taskId: task.id,
-      type: 'command' as const,
-      content: `You: ${message || '(images only)'}${imageNote}`,
-      timestamp: Date.now(),
-    }]);
-    try {
-      let attachmentIds: string[] | undefined;
-      if (imagesToUpload.length > 0) {
-        const uploaded = await api.uploadAttachments(task.id, imagesToUpload);
-        attachmentIds = uploaded.map(a => a.id);
-      }
-      await api.sendMessage(task.id, message || 'See the attached images.', attachmentIds);
-    } catch (err) {
-      console.error('[AgentPanel] failed to send follow-up:', err);
-    } finally {
-      setSending(false);
+  const handleRequestChanges = async () => {
+    const trimmedFeedback = feedback.trim();
+    if (!task || task.columnId !== 'review' || !trimmedFeedback || requestingChanges) return;
+    if (!onRequestChanges) {
+      setRequestChangesError('当前无法发起修改，请刷新后重试。');
+      return;
     }
+
+    setRequestingChanges(true);
+    setRequestChangesError(null);
+    const result = await onRequestChanges(task.id, trimmedFeedback);
+    setRequestingChanges(false);
+    if (!result) {
+      setRequestChangesError('发起修改失败，请检查任务状态后重试。');
+      return;
+    }
+
+    setRevisions((current) => current.some((revision) => revision.id === result.revision.id)
+      ? current
+      : [...current, result.revision]);
+    setFeedback('');
   };
 
   return (
@@ -801,7 +813,7 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
               {/* PR / Cleanup actions — show when task is done or complete */}
               {(task.agentStatus === 'complete' || task.columnId === 'done') && (
                 <div className="flex items-center gap-2 pt-1">
-                  {!prUrl && onCreatePR && hasRemote === true && (
+                  {!displayedPrUrl && onCreatePR && hasRemote === true && (
                     <button
                       onClick={async () => {
                         setPrLoading(true);
@@ -821,9 +833,9 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
                       {prLoading ? 'Creating...' : 'Create PR'}
                     </button>
                   )}
-                  {prUrl && (
+                  {displayedPrUrl && (
                     <a
-                      href={prUrl}
+                      href={displayedPrUrl}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/20 transition-colors"
@@ -908,13 +920,13 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
           )}
 
           {/* Tab bar */}
-          <div className="shrink-0 flex items-center justify-between border-b border-border px-2 pt-1">
-            <div className="flex gap-1">
+          <div className="flex shrink-0 items-center justify-between gap-1 border-b border-border px-2 pt-1">
+            <div className="min-w-0 flex flex-1 gap-0.5 overflow-x-auto">
             {showSummaryTab && (
               <button
                 onClick={() => selectTab('summary')}
                 className={cn(
-                  'px-3 py-1.5 text-xs font-medium rounded-t transition-colors',
+                  'shrink-0 whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-t transition-colors',
                   activeTab === 'summary'
                     ? 'bg-card border border-border border-b-card text-foreground -mb-px'
                     : 'text-muted-foreground hover:text-foreground'
@@ -926,7 +938,7 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
             <button
               onClick={() => selectTab('events')}
               className={cn(
-                'px-3 py-1.5 text-xs font-medium rounded-t transition-colors',
+                'shrink-0 whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-t transition-colors',
                 activeTab === 'events'
                   ? 'bg-card border border-border border-b-card text-foreground -mb-px'
                   : 'text-muted-foreground hover:text-foreground'
@@ -937,7 +949,7 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
             <button
               onClick={() => selectTab('terminal')}
               className={cn(
-                'px-3 py-1.5 text-xs font-medium rounded-t transition-colors',
+                'shrink-0 whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-t transition-colors',
                 activeTab === 'terminal'
                   ? 'bg-card border border-border border-b-card text-foreground -mb-px'
                   : 'text-muted-foreground hover:text-foreground'
@@ -948,13 +960,24 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
             <button
               onClick={() => selectTab('changes')}
               className={cn(
-                'px-3 py-1.5 text-xs font-medium rounded-t transition-colors',
+                'shrink-0 whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-t transition-colors',
                 activeTab === 'changes'
                   ? 'bg-card border border-border border-b-card text-foreground -mb-px'
                   : 'text-muted-foreground hover:text-foreground'
               )}
             >
               Actions{fileChanges.length > 0 ? ` (${fileChanges.length})` : ''}
+            </button>
+            <button
+              onClick={() => selectTab('revisions')}
+              className={cn(
+                'shrink-0 whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-t transition-colors',
+                activeTab === 'revisions'
+                  ? 'bg-card border border-border border-b-card text-foreground -mb-px'
+                  : 'text-muted-foreground hover:text-foreground'
+              )}
+            >
+              修改记录 ({revisions.length})
             </button>
             </div>
             {events.length > 0 && (
@@ -982,28 +1005,63 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
 
           {/* Summary view */}
           {activeTab === 'summary' && (
-            <div className="flex-1 overflow-y-auto p-4">
-              {summaryText ? (
-                <>
-                  {!completedSectionFilled && (
-                    <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                      <AlertCircle className="h-4 w-4 shrink-0" />
-                      The required “Completed” section is empty or missing.
+            <section aria-label="Summary" className="flex min-h-0 flex-1 flex-col">
+              <div className="min-h-0 flex-1 overflow-y-auto p-4">
+                {hasHeldRevisions && <HeldRevisionNotice />}
+                {summaryText ? (
+                  <>
+                    {!completedSectionFilled && (
+                      <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                        <AlertCircle className="h-4 w-4 shrink-0" />
+                        The required “Completed” section is empty or missing.
+                      </div>
+                    )}
+                    <div className="prose prose-sm dark:prose-invert max-w-none text-foreground [&_h2]:mt-4 [&_h2]:mb-1 [&_h2]:text-sm [&_h2]:font-semibold [&_h2:first-child]:mt-0">
+                      <Markdown>{summaryText}</Markdown>
                     </div>
-                  )}
-                  <div className="prose prose-sm dark:prose-invert max-w-none text-foreground [&_h2]:mt-4 [&_h2]:mb-1 [&_h2]:text-sm [&_h2]:font-semibold [&_h2:first-child]:mt-0">
-                    <Markdown>{summaryText}</Markdown>
+                  </>
+                ) : (
+                  <div className="flex min-h-48 items-center justify-center">
+                    <div className="text-center">
+                      <FileText className="mx-auto h-10 w-10 text-muted-foreground/20" />
+                      <p className="mt-3 text-sm text-muted-foreground/50">No summary was provided for this task.</p>
+                    </div>
                   </div>
-                </>
-              ) : (
-                <div className="flex h-full items-center justify-center">
-                  <div className="text-center">
-                    <FileText className="mx-auto h-10 w-10 text-muted-foreground/20" />
-                    <p className="mt-3 text-sm text-muted-foreground/50">No summary was provided for this task.</p>
+                )}
+              </div>
+
+              {columnId === 'review' && (
+                <div className="shrink-0 border-t border-border bg-card px-4 py-3">
+                  <label htmlFor={`review-feedback-${task.id}`} className="mb-2 block text-xs font-semibold text-foreground">
+                    修改意见
+                  </label>
+                  <textarea
+                    id={`review-feedback-${task.id}`}
+                    value={feedback}
+                    onChange={(event) => setFeedback(event.target.value)}
+                    placeholder="填写修改意见…"
+                    rows={3}
+                    disabled={requestingChanges}
+                    className="w-full resize-none rounded-lg border border-border bg-muted px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                  {requestChangesError && (
+                    <p role="alert" className="mt-2 text-xs text-red-600 dark:text-red-400">
+                      {requestChangesError}
+                    </p>
+                  )}
+                  <div className="mt-2 flex justify-end">
+                    <button
+                      type="button"
+                      onClick={handleRequestChanges}
+                      disabled={requestingChanges || feedback.trim().length === 0}
+                      className="rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {requestingChanges ? '正在发起…' : '发起修改'}
+                    </button>
                   </div>
                 </div>
               )}
-            </div>
+            </section>
           )}
 
           {/* Terminal view */}
@@ -1109,76 +1167,204 @@ export function AgentPanel({ task, onClose, onRun, onStop, onCreatePR, onMergeLo
           </div>
           )}
 
-          {/* Follow-up message input — fixed at bottom */}
-          <div className="shrink-0 border-t border-border bg-card px-3 py-2">
-            {/* Image previews */}
-            {followUpImages.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 mb-2">
-                {followUpImages.map((f, i) => (
-                  <div key={i} className="relative group">
-                    <FollowUpImagePreview file={f} />
-                    <button
-                      type="button"
-                      onClick={() => setFollowUpImages(prev => prev.filter((_, j) => j !== i))}
-                      className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white text-[10px] leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => imageInputRef.current?.click()}
-                disabled={agentStatus !== 'executing' || sending}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground hover:text-foreground hover:bg-accent transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                title="Attach images"
-              >
-                <Paperclip className="h-3.5 w-3.5" />
-              </button>
-              <input
-                ref={imageInputRef}
-                type="file"
-                accept="image/*"
-                multiple
-                className="hidden"
-                onChange={(e) => {
-                  if (e.target.files) {
-                    setFollowUpImages(prev => [...prev, ...Array.from(e.target.files!)]);
-                    e.target.value = '';
-                  }
-                }}
-              />
-              <input
-                type="text"
-                value={followUpMessage}
-                onChange={(e) => setFollowUpMessage(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSendFollowUp();
-                  }
-                }}
-                placeholder="Send a message to the agent..."
-                disabled={agentStatus !== 'executing' || sending}
-                className="flex-1 rounded-md border border-border bg-muted px-3 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
-              />
-              <button
-                onClick={handleSendFollowUp}
-                disabled={agentStatus !== 'executing' || sending || (!followUpMessage.trim() && followUpImages.length === 0)}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-muted text-primary hover:bg-primary/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                title="Send message"
-              >
-                <Send className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
+          {activeTab === 'revisions' && (
+            <RevisionHistory
+              key={task.id}
+              revisions={revisions}
+              loading={revisionsLoading}
+              error={revisionsError}
+            />
+          )}
         </motion.div>
         </>
       )}
     </AnimatePresence>
+  );
+}
+
+const revisionStatusDisplay: Record<TaskRevision['status'], { label: string; className: string }> = {
+  pending: { label: '执行中', className: 'text-blue-700 bg-blue-500/10 dark:text-blue-300' },
+  'in-progress': { label: '执行中', className: 'text-blue-700 bg-blue-500/10 dark:text-blue-300' },
+  complete: { label: '已完成', className: 'text-emerald-700 bg-emerald-500/10 dark:text-emerald-300' },
+  failed: { label: '失败', className: 'text-red-700 bg-red-500/10 dark:text-red-300' },
+};
+
+const revisionPushStatusDisplay: Record<TaskRevision['pushStatus'], { label: string; className: string }> = {
+  local: { label: '仅本地', className: 'text-muted-foreground bg-muted' },
+  held: { label: '推送已暂缓', className: 'text-amber-700 bg-amber-500/10 dark:text-amber-300' },
+  pushed: { label: '已推送', className: 'text-blue-700 bg-blue-500/10 dark:text-blue-300' },
+  released: { label: '已授权并推送', className: 'text-emerald-700 bg-emerald-500/10 dark:text-emerald-300' },
+};
+
+const unknownRevisionPushStatus = {
+  label: '历史状态未知',
+  className: 'text-muted-foreground bg-muted',
+};
+
+function getRevisionPushStatusDisplay(pushStatus: TaskRevision['pushStatus'] | null | undefined) {
+  return pushStatus ? revisionPushStatusDisplay[pushStatus] : unknownRevisionPushStatus;
+}
+
+function formatRevisionTime(timestamp: number) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(timestamp);
+}
+
+function HeldRevisionNotice() {
+  return (
+    <div role="status" className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-700 dark:text-amber-300">
+      存在未授权推送的修改
+    </div>
+  );
+}
+
+function RevisionHistory({ revisions, loading, error }: {
+  revisions: TaskRevision[];
+  loading: boolean;
+  error: string | null;
+}) {
+  const sortedRevisions = useMemo(
+    () => [...revisions].sort((a, b) => b.revisionNumber - a.revisionNumber),
+    [revisions]
+  );
+  const latestRevision = sortedRevisions[0];
+  const [expandedRevisionIds, setExpandedRevisionIds] = useState<Set<string>>(new Set());
+  const hasHeldRevisions = sortedRevisions.some((revision) => revision.pushStatus === 'held');
+
+  useEffect(() => {
+    if (!latestRevision) return;
+    setExpandedRevisionIds((current) => {
+      if (current.has(latestRevision.id)) return current;
+      const next = new Set(current);
+      next.add(latestRevision.id);
+      return next;
+    });
+  }, [latestRevision]);
+
+  const toggleRevision = (revisionId: string) => {
+    setExpandedRevisionIds((current) => {
+      const next = new Set(current);
+      if (next.has(revisionId)) next.delete(revisionId);
+      else next.add(revisionId);
+      return next;
+    });
+  };
+
+  return (
+    <section aria-label="修改记录" className="min-h-0 flex-1 overflow-y-auto bg-muted/20 p-3">
+      {hasHeldRevisions && <HeldRevisionNotice />}
+      {loading && <p className="px-1 text-xs text-muted-foreground">正在加载…</p>}
+      {!loading && error && <p role="alert" className="px-1 text-xs text-red-600 dark:text-red-400">加载失败：{error}</p>}
+      {!loading && !error && revisions.length === 0 && (
+        <div className="flex h-full min-h-48 items-center justify-center">
+          <p className="text-sm text-muted-foreground/60">暂无修改记录</p>
+        </div>
+      )}
+      {!loading && !error && revisions.length > 0 && (
+        <ol className="space-y-2.5">
+          {sortedRevisions.map((revision) => {
+            const status = revisionStatusDisplay[revision.status];
+            const pushStatus = getRevisionPushStatusDisplay(revision.pushStatus);
+            const isLatest = revision.id === latestRevision?.id;
+            const isExpanded = expandedRevisionIds.has(revision.id);
+            const contentId = `revision-${revision.id}-content`;
+            return (
+              <li data-testid={`revision-card-${revision.revisionNumber}`} key={revision.id} className={cn(
+                'overflow-hidden rounded-lg border bg-card',
+                isLatest ? 'border-primary/35' : 'border-border'
+              )}>
+                <button
+                  type="button"
+                  aria-expanded={isExpanded}
+                  aria-controls={contentId}
+                  onClick={() => toggleRevision(revision.id)}
+                  className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors hover:bg-accent/40"
+                >
+                  {isExpanded
+                    ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span className="text-xs font-semibold text-foreground">第 {revision.revisionNumber} 轮</span>
+                      {isLatest && (
+                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                          当前轮次
+                        </span>
+                      )}
+                      <time className="text-[10px] text-muted-foreground" dateTime={new Date(revision.createdAt).toISOString()}>
+                        {formatRevisionTime(revision.createdAt)}
+                      </time>
+                    </div>
+                    <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] text-muted-foreground">
+                      <span className={cn('rounded-full px-2 py-0.5 font-medium', status.className)}>{status.label}</span>
+                      <span className={cn('rounded-full px-2 py-0.5 font-medium', pushStatus.className)}>{pushStatus.label}</span>
+                      <code className="truncate rounded bg-muted px-1.5 py-0.5 font-mono text-foreground">
+                        {revision.commitSha ? revision.commitSha.slice(0, 7) : '无提交'}
+                      </code>
+                    </div>
+                  </div>
+                </button>
+
+                {isExpanded && (
+                  <div id={contentId} className="border-t border-border px-4 py-3">
+                    <dl className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-xs">
+                      <dt className="text-muted-foreground">Revision</dt>
+                      <dd className="font-medium text-foreground">第 {revision.revisionNumber} 轮</dd>
+                      <dt className="text-muted-foreground">时间</dt>
+                      <dd className="text-foreground">{formatRevisionTime(revision.createdAt)}</dd>
+                      <dt className="text-muted-foreground">执行状态</dt>
+                      <dd><span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', status.className)}>{status.label}</span></dd>
+                      <dt className="text-muted-foreground">Push 状态</dt>
+                      <dd><span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', pushStatus.className)}>{pushStatus.label}</span></dd>
+                      <dt className="text-muted-foreground">Commit SHA</dt>
+                      <dd>
+                        {revision.commitSha
+                          ? <code className="break-all rounded bg-muted px-1.5 py-0.5 font-mono text-foreground">{revision.commitSha}</code>
+                          : <span className="text-muted-foreground">无提交</span>}
+                      </dd>
+                      {revision.pushedAt && (
+                        <>
+                          <dt className="text-muted-foreground">推送时间</dt>
+                          <dd className="text-foreground">{formatRevisionTime(revision.pushedAt)}</dd>
+                        </>
+                      )}
+                      {revision.releasedByRevisionId && (
+                        <>
+                          <dt className="text-muted-foreground">授权轮次</dt>
+                          <dd><code className="break-all font-mono text-foreground">{revision.releasedByRevisionId}</code></dd>
+                        </>
+                      )}
+                    </dl>
+
+                    <div className="mt-4 border-t border-border pt-3">
+                      <h5 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">用户修改意见</h5>
+                      <p className="mt-1.5 whitespace-pre-wrap text-xs leading-relaxed text-foreground">{revision.feedback}</p>
+                    </div>
+
+                    <div className="mt-4 border-t border-border pt-3">
+                      <h5 className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Agent Result</h5>
+                      {revision.agentSummary ? (
+                        <div className="prose prose-sm dark:prose-invert mt-1.5 max-w-none text-xs text-foreground [&_h2]:mb-1 [&_h2]:mt-3 [&_h2]:text-xs [&_h2]:font-semibold [&_h2:first-child]:mt-0">
+                          <Markdown>{revision.agentSummary}</Markdown>
+                        </div>
+                      ) : (
+                        <p className="mt-1.5 text-xs text-muted-foreground">暂无 Agent 结果</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
   );
 }
 
@@ -1221,10 +1407,4 @@ function FailureSummary({ message }: { message: string }) {
       </div>
     </div>
   );
-}
-
-function FollowUpImagePreview({ file }: { file: File }) {
-  const url = useMemo(() => URL.createObjectURL(file), [file]);
-  useEffect(() => () => URL.revokeObjectURL(url), [url]);
-  return <img src={url} alt={file.name} className="w-10 h-10 object-cover rounded border border-border" />;
 }

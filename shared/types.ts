@@ -2,6 +2,8 @@ export type Priority = 'low' | 'medium' | 'high' | 'critical';
 export type ColumnId = 'backlog' | 'in-progress' | 'review' | 'done';
 export type AgentStatus = 'idle' | 'planning' | 'executing' | 'complete' | 'failed';
 export type AgentType = 'copilot' | 'claude' | 'codex' | 'opencode' | 'hermes' | 'openclaw' | 'grok';
+export type TaskRevisionStatus = 'pending' | 'in-progress' | 'complete' | 'failed';
+export type TaskRevisionPushStatus = 'local' | 'held' | 'pushed' | 'released';
 
 export interface AgentInfo {
   name: AgentType;
@@ -33,6 +35,8 @@ export interface Task {
   attachments?: TaskAttachment[];
   projectId: string;
   summary?: string | null;
+  /** Existing pull request for this task branch, persisted across reloads. */
+  prUrl?: string | null;
   runRequestedAt?: number;
   runClaimedAt?: number;
   externalSource?: string;
@@ -40,6 +44,32 @@ export interface Task {
   provenance?: TaskProvenance;
   /** Optional execution limit for this task. Omit to use the server default. */
   timeoutMinutes?: number | null;
+}
+
+/** One immutable user-feedback round plus the result of the fresh agent run it triggered. */
+export interface TaskRevision {
+  id: string;
+  taskId: string;
+  revisionNumber: number;
+  feedback: string;
+  status: TaskRevisionStatus;
+  createdAt: number;
+  startedAt?: number;
+  completedAt?: number;
+  previousSummary?: string | null;
+  agentSummary?: string | null;
+  commitSha?: string | null;
+  /** Durable publication state; `held` always requires a later explicit user release. */
+  pushStatus: TaskRevisionPushStatus;
+  /** Time the revision commit was confirmed on the task branch's remote ref. */
+  pushedAt?: number;
+  /** Later revision whose explicit authorization released this held revision. */
+  releasedByRevisionId?: string | null;
+}
+
+export interface RequestChangesResponse {
+  task: Task;
+  revision: TaskRevision;
 }
 
 export interface TaskProvenance {

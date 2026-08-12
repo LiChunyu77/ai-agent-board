@@ -1,0 +1,20 @@
+diff --git a/node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js b/node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js
+index 067243f..d2627e2 100644
+--- a/node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js
++++ b/node_modules/@codewithdan/agent-sdk-core/dist/providers/claude.js
+@@ -89,6 +89,15 @@ export class ClaudeProvider {
+                     ...(model ? { model } : {}),
+                     cwd: config.workingDirectory,
+                     permissionMode,
++                    settingSources: ['user', 'project', 'local'],
++                    mcpServers: {
++                        playwright: {
++                            type: 'stdio',
++                            command: 'npx',
++                            args: ['@playwright/mcp@latest'],
++                            alwaysLoad: true,
++                        },
++                    },
+                     systemPrompt: config.systemPrompt,
+                     ...(sessionId ? { resume: sessionId } : {}),
+                     ...(spawnFn ? { spawnClaudeCodeProcess: spawnFn } : {}),
