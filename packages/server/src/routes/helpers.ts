@@ -552,15 +552,21 @@ export function makeStatusCallback(repo: TaskRepository, taskId: string): (statu
       statusUpdates.completedAt = Date.now();
       statusUpdates.columnId = 'review';
     }
+    if (status === 'complete' || status === 'failed') {
+      statusUpdates.runRequestedAt = undefined;
+      statusUpdates.runClaimedAt = undefined;
+    }
     const t = await repo.update(taskId, statusUpdates);
-    if (t) broadcastTaskUpdate(t);
+    if (!t) throw new Error('task status could not be saved');
+    broadcastTaskUpdate(t);
   };
 }
 
 export function makeWorktreeCallback(repo: TaskRepository, taskId: string): (worktreePath: string) => void {
   return async (worktreePath) => {
     const t = await repo.update(taskId, { worktreePath });
-    if (t) broadcastTaskUpdate(t);
+    if (!t) throw new Error('worktree path could not be saved');
+    broadcastTaskUpdate(t);
   };
 }
 
@@ -596,7 +602,6 @@ export async function startAgentForTask(
             startedAt: activeRevision.startedAt ?? Date.now(),
           });
         }
-        if (status === 'complete' || status === 'failed') await repo.clearRun(task.id);
         await onStatusChange(status);
       },
       makeWorktreeCallback(repo, task.id),
@@ -625,7 +630,7 @@ export async function startAgentForTask(
             : completion.status === 'complete' && completion.commitSha && !pushPermission.allowed
               ? 'held'
               : 'local';
-          await repo.finalizeRevision(activeRevision.id, {
+          const finalized = await repo.finalizeRevision(activeRevision.id, {
             status: completion.status,
             completedAt,
             agentSummary: completion.agentSummary,
@@ -634,6 +639,14 @@ export async function startAgentForTask(
             pushedAt: pushed ? completedAt : undefined,
             releaseHeldRevisions: pushed && hasHeldRevisions && pushPermission.allowed,
           });
+          if (!finalized) throw new Error('revision result could not be saved');
+        },
+        onPersistenceFailure: async () => {
+          const failed = await repo.updateRevision(activeRevision.id, {
+            status: 'failed',
+            completedAt: Date.now(),
+          });
+          if (!failed) throw new Error('revision failure state could not be saved');
         },
       } : undefined,
     );

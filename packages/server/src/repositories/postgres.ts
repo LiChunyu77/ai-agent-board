@@ -25,6 +25,7 @@ interface TaskRow {
   group_id: string | null;
   group_order: number | null;
   summary: string | null;
+  commit_sha: string | null;
   external_source: string | null; external_key: string | null; provenance: string | null;
   run_requested_at: string | null; run_claimed_at: string | null;
   timeout_minutes: number | null;
@@ -90,7 +91,7 @@ function rowToTask(row: TaskRow): Task {
     archived: row.archived,
     groupId: row.group_id ?? undefined,
     groupOrder: row.group_order ?? undefined,
-    summary: row.summary ?? null, externalSource: row.external_source ?? undefined, externalKey: row.external_key ?? undefined,
+    summary: row.summary ?? null, commitSha: row.commit_sha ?? null, externalSource: row.external_source ?? undefined, externalKey: row.external_key ?? undefined,
     provenance: row.provenance ? JSON.parse(row.provenance) : undefined,
     runRequestedAt: row.run_requested_at != null ? Number(row.run_requested_at) : undefined, runClaimedAt: row.run_claimed_at != null ? Number(row.run_claimed_at) : undefined,
     timeoutMinutes: row.timeout_minutes ?? undefined,
@@ -148,8 +149,8 @@ export class PostgresTaskRepository implements TaskRepository {
     await this.pool.query(
       `INSERT INTO tasks (id, project_id, title, description, priority, column_id, agent_status, agent_type,
         created_at, started_at, completed_at, repo_path, branch_name, base_branch, use_worktree, worktree_path, archived,
-        group_id, group_order, summary, external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes, pr_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)`,
+        group_id, group_order, summary, commit_sha, external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes, pr_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)`,
       [
         task.id,
         task.projectId,
@@ -170,7 +171,7 @@ export class PostgresTaskRepository implements TaskRepository {
         task.archived ?? false,
         task.groupId ?? null,
         task.groupOrder ?? null,
-        task.summary ?? null, task.externalSource ?? null, task.externalKey ?? null, task.provenance ? JSON.stringify(task.provenance) : null, task.runRequestedAt ?? null, task.runClaimedAt ?? null, task.timeoutMinutes ?? null, task.prUrl ?? null,
+        task.summary ?? null, task.commitSha ?? null, task.externalSource ?? null, task.externalKey ?? null, task.provenance ? JSON.stringify(task.provenance) : null, task.runRequestedAt ?? null, task.runClaimedAt ?? null, task.timeoutMinutes ?? null, task.prUrl ?? null,
       ]
     );
     return task;
@@ -205,9 +206,9 @@ export class PostgresTaskRepository implements TaskRepository {
           title = $1, description = $2, priority = $3, column_id = $4,
           agent_status = $5, agent_type = $6, started_at = $7, completed_at = $8,
           repo_path = $9, branch_name = $10, base_branch = $11, use_worktree = $12,
-          worktree_path = $13, archived = $14, summary = $15, run_requested_at=$16, run_claimed_at=$17,
-          timeout_minutes=$18, pr_url=$19
-        WHERE id = $20`,
+          worktree_path = $13, archived = $14, summary = $15, commit_sha = $16, run_requested_at=$17, run_claimed_at=$18,
+          timeout_minutes=$19, pr_url=$20
+        WHERE id = $21`,
         [
           merged.title,
           merged.description,
@@ -223,7 +224,7 @@ export class PostgresTaskRepository implements TaskRepository {
           merged.useWorktree ?? null,
           merged.worktreePath ?? null,
           merged.archived ?? false,
-          merged.summary ?? null, merged.runRequestedAt ?? null, merged.runClaimedAt ?? null, merged.timeoutMinutes ?? null, merged.prUrl ?? null,
+          merged.summary ?? null, merged.commitSha ?? null, merged.runRequestedAt ?? null, merged.runClaimedAt ?? null, merged.timeoutMinutes ?? null, merged.prUrl ?? null,
           id,
         ]
       );

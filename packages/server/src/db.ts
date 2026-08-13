@@ -60,6 +60,7 @@ export function migrateSqliteDatabase(db: Database.Database): void {
       started_at    INTEGER,
       completed_at  INTEGER,
       summary       TEXT,
+      commit_sha    TEXT,
       pr_url        TEXT
     )
   `);
@@ -143,6 +144,7 @@ export function migrateSqliteDatabase(db: Database.Database): void {
   if (!colNames.has('summary')) {
     db.exec(`ALTER TABLE tasks ADD COLUMN summary TEXT`);
   }
+  if (!colNames.has('commit_sha')) db.exec(`ALTER TABLE tasks ADD COLUMN commit_sha TEXT`);
   if (!colNames.has('external_source')) db.exec(`ALTER TABLE tasks ADD COLUMN external_source TEXT`);
   if (!colNames.has('external_key')) db.exec(`ALTER TABLE tasks ADD COLUMN external_key TEXT`);
   if (!colNames.has('provenance')) db.exec(`ALTER TABLE tasks ADD COLUMN provenance TEXT`);
@@ -337,6 +339,7 @@ function ensureSqliteProjectForeignKeys(db: Database.Database): void {
         group_id      TEXT,
         group_order   INTEGER,
         summary       TEXT,
+        commit_sha    TEXT,
         external_source TEXT,
         external_key TEXT,
         provenance TEXT,
@@ -351,13 +354,13 @@ function ensureSqliteProjectForeignKeys(db: Database.Database): void {
       INSERT INTO tasks_new (
         id, title, description, priority, column_id, agent_status, created_at,
         started_at, completed_at, repo_path, branch_name, base_branch, use_worktree,
-        worktree_path, agent_type, archived, project_id, group_id, group_order, summary,
+        worktree_path, agent_type, archived, project_id, group_id, group_order, summary, commit_sha,
         external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes, pr_url
       )
       SELECT
         id, title, description, priority, column_id, agent_status, created_at,
         started_at, completed_at, repo_path, branch_name, base_branch, use_worktree,
-        worktree_path, agent_type, archived, project_id, group_id, group_order, summary,
+        worktree_path, agent_type, archived, project_id, group_id, group_order, summary, commit_sha,
         external_source, external_key, provenance, run_requested_at, run_claimed_at, timeout_minutes, pr_url
       FROM tasks;
 
@@ -452,6 +455,7 @@ export async function initPostgresDatabase(pool: Pool): Promise<void> {
       archived      BOOLEAN NOT NULL DEFAULT FALSE,
       project_id    TEXT NOT NULL DEFAULT 'default',
       timeout_minutes INTEGER,
+      commit_sha    TEXT,
       pr_url        TEXT
     )
   `);
@@ -477,6 +481,7 @@ export async function initPostgresDatabase(pool: Pool): Promise<void> {
   await addCol('group_id', 'TEXT');
   await addCol('group_order', 'INTEGER');
   await addCol('summary', 'TEXT');
+  await addCol('commit_sha', 'TEXT');
   await addCol('external_source', 'TEXT');
   await addCol('external_key', 'TEXT');
   await addCol('provenance', 'TEXT');

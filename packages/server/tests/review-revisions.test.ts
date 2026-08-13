@@ -767,7 +767,7 @@ test('explicit merge authorization remains opt-in and high-confidence', () => {
   assert.match(prompt, /feedback explicitly authorizes merge/i);
 });
 
-test('no-commit revision may finish with local uncommitted changes', () => {
+test('no-commit revision with local changes requires attention and preserves the files', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-no-commit-revision-'));
   const git = (args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' }).toString().trim();
   try {
@@ -780,7 +780,10 @@ test('no-commit revision may finish with local uncommitted changes', () => {
     fs.appendFileSync(path.join(root, 'README.md'), 'local revision\n');
     const task = { ...reviewTask(), repoPath: root };
 
-    assert.equal(inspectRevisionCompletion(task, root, true), undefined);
+    assert.throws(
+      () => inspectRevisionCompletion(task, root, true),
+      /uncommitted changes.*preserved/i,
+    );
     assert.throws(
       () => inspectRevisionCompletion(task, root, false),
       /uncommitted changes/,

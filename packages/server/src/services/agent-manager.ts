@@ -38,6 +38,7 @@ interface ManagedSession {
   agentType: AgentType;
   revisionId?: string;
   onComplete?: AgentRunOptions['onComplete'];
+  onPersistenceFailure?: AgentRunOptions['onPersistenceFailure'];
   completionSent?: boolean;
 }
 
@@ -63,9 +64,16 @@ export interface AgentRunCompletion {
   error?: string;
 }
 
+interface GitRunResult {
+  endHeadSha: string;
+  commitSha?: string;
+  noChanges: boolean;
+}
+
 export interface AgentRunOptions {
   revision?: AgentRevisionContext;
   onComplete?: (completion: AgentRunCompletion) => void | Promise<void>;
+  onPersistenceFailure?: (error: string) => void | Promise<void>;
 }
 
 // Event log per task (capped to prevent unbounded growth)
@@ -341,13 +349,64 @@ export function inspectRevisionCompletion(
     cwd: workingDirectory,
     stdio: 'pipe',
   }).toString().trim();
-  if (dirty && !commitProhibited) throw new Error('Revision finished with uncommitted changes');
+  if (dirty) throw new Error('Revision finished with uncommitted changes; the worktree was preserved for attention');
   if (commitProhibited) return undefined;
   const commitSha = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
     cwd: workingDirectory,
     stdio: 'pipe',
   }).toString().trim();
   return /^[0-9a-f]{40,64}$/i.test(commitSha) ? commitSha : undefined;
+}
+
+function readGitHead(workingDirectory: string): string | undefined {
+  try {
+    const commitSha = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+      cwd: workingDirectory,
+      stdio: 'pipe',
+    }).toString().trim();
+    return /^[0-9a-f]{40,64}$/i.test(commitSha) ? commitSha : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Prove that a successful provider run left either a new commit or an explicitly clean no-op. */
+export function inspectRunCompletion(
+  task: Task,
+  workingDirectory: string,
+  startHeadSha: string | undefined,
+): GitRunResult {
+  if (task.branchName) {
+    assertSafeGitBranch(task.branchName, 'branchName');
+    const currentBranch = execFileSync('git', ['branch', '--show-current'], {
+      cwd: workingDirectory,
+      stdio: 'pipe',
+    }).toString().trim();
+    if (currentBranch !== task.branchName) {
+      throw new Error(`Task finished on ${currentBranch || 'detached HEAD'} instead of ${task.branchName}`);
+    }
+  }
+  const dirty = execFileSync('git', ['status', '--porcelain'], {
+    cwd: workingDirectory,
+    stdio: 'pipe',
+  }).toString().trim();
+  if (dirty) {
+    throw new Error('Task finished with uncommitted changes; commit failed or was not created. The worktree was preserved for attention');
+  }
+  const commitSha = readGitHead(workingDirectory);
+  if (!commitSha) throw new Error('Task finished without a persistent Git commit');
+  if (commitSha === startHeadSha) return { endHeadSha: commitSha, noChanges: true };
+  if (startHeadSha) {
+    try {
+      execFileSync('git', ['merge-base', '--is-ancestor', startHeadSha, commitSha], {
+        cwd: workingDirectory,
+        stdio: 'pipe',
+      });
+    } catch {
+      throw new Error('Task branch history was rewritten instead of advanced; the worktree was preserved for attention');
+    }
+  }
+  return { endHeadSha: commitSha, commitSha, noChanges: false };
 }
 
 /** Read-only confirmation that a revision commit is included in origin/<task branch>. */
@@ -940,13 +999,8 @@ export class AgentManager {
 
   private async notifyRunComplete(entry: ManagedSession, completion: AgentRunCompletion): Promise<void> {
     if (entry.completionSent) return;
+    if (entry.onComplete) await entry.onComplete(completion);
     entry.completionSent = true;
-    if (!entry.onComplete) return;
-    try {
-      await entry.onComplete(completion);
-    } catch (err: unknown) {
-      console.error('[agent-manager] run completion callback failed:', errorMessage(err));
-    }
   }
 
   startAgent(
@@ -968,16 +1022,22 @@ export class AgentManager {
       agentType,
       revisionId: options.revision?.revisionId,
       onComplete: options.onComplete,
+      onPersistenceFailure: options.onPersistenceFailure,
     };
     // Install before availability checks so early failures complete a durable revision.
     this.sessions.set(task.id, managedEntry);
 
-    // Clear any prior run's summary so a rerun never displays a stale result
-    // (e.g. if this run fails before producing a new summary).
-    if (task.summary != null) {
-      void this.eventRepo?.update(task.id, { summary: null }).catch(() => {});
+    // Clear prior result metadata before execution so a failed rerun cannot
+    // present an older commit or summary as the current result.
+    let resultResetPersisted = Promise.resolve();
+    if (task.summary != null || task.commitSha != null) {
+      resultResetPersisted = (async () => {
+        if (!this.eventRepo) throw new Error('task repository is unavailable');
+        const reset = await this.eventRepo.update(task.id, { summary: null, commitSha: null });
+        if (!reset) throw new Error('prior task result could not be cleared');
+      })();
     }
-    const terminateOnce = async (status: 'complete' | 'failed', failureMessage?: string) => {
+    const terminateOnce = async (requestedStatus: 'complete' | 'failed', requestedFailureMessage?: string) => {
       if (terminated) return;
       // If the task was stopped by the user, stopAgent already handled cleanup
       if (this.stoppedTasks.has(task.id)) { terminated = true; return; }
@@ -986,8 +1046,46 @@ export class AgentManager {
       if (entry?.timeoutId) clearTimeout(entry.timeoutId);
       const duration = Date.now() - sessionStartTime;
 
-      // Item 5: Emit structured summary event
-      if (status === 'complete') {
+      let status = requestedStatus;
+      let failureMessage = requestedFailureMessage;
+      let terminalStatusPersisted = false;
+      try {
+        await this.notifyRunComplete(entry, {
+          revisionId: entry.revisionId,
+          status,
+          agentSummary,
+          commitSha,
+          pushed,
+          error: failureMessage,
+        });
+        await onStatusChange(status);
+        terminalStatusPersisted = true;
+      } catch (err: unknown) {
+        status = 'failed';
+        failureMessage = `Task result persistence failed: ${errorMessage(err)}`;
+        console.error(`[agent-manager] ${failureMessage}`);
+        try { await entry.onPersistenceFailure?.(failureMessage); } catch (compensationErr: unknown) {
+          console.error(`[agent-manager] failed to compensate completion metadata for task ${task.id}:`, errorMessage(compensationErr));
+        }
+        try { await onStatusChange('failed'); } catch (statusErr: unknown) {
+          console.error(`[agent-manager] failed to persist failed status for task ${task.id}:`, errorMessage(statusErr));
+        }
+        try {
+          terminalStatusPersisted = (await this.eventRepo?.getById(task.id))?.agentStatus === 'failed';
+        } catch {
+          terminalStatusPersisted = false;
+        }
+      }
+
+      // Emit terminal signals only after result and status persistence have succeeded.
+      if (!terminalStatusPersisted) {
+        this.emitEvent(task.id, {
+          id: uuid(), taskId: task.id, type: 'error',
+          content: failureMessage || 'Task terminal state could not be persisted. The worktree was preserved for attention.',
+          timestamp: Date.now(),
+          metadata: { agentType, duration, error: failureMessage },
+        });
+      } else if (status === 'complete') {
         this.emitEvent(task.id, {
           id: uuid(), taskId: task.id, type: 'complete',
           content: 'Task completed successfully.',
@@ -1003,31 +1101,19 @@ export class AgentManager {
         });
       }
 
-      // Item 2: Broadcast agent_complete WS event
-      broadcast({
-        type: 'agent_complete',
-        payload: {
-          taskId: task.id,
-          status,
-          agentType,
-          duration,
-          eventCount: (await this.getEvents(task.id)).length,
-        },
-      });
-
-      await this.notifyRunComplete(entry, {
-        revisionId: entry.revisionId,
-        status,
-        agentSummary,
-        commitSha,
-        pushed,
-        error: failureMessage,
-      });
-      try {
-        await onStatusChange(status);
-      } catch (err: unknown) {
-        console.error(`[agent-manager] failed to persist status for task ${task.id}:`, errorMessage(err));
+      if (terminalStatusPersisted) {
+        broadcast({
+          type: 'agent_complete',
+          payload: {
+            taskId: task.id,
+            status,
+            agentType,
+            duration,
+            eventCount: (await this.getEvents(task.id)).length,
+          },
+        });
       }
+
       if (this.sessions.get(task.id) === entry) this.sessions.delete(task.id);
     };
 
@@ -1097,9 +1183,12 @@ export class AgentManager {
     // Launch the agent session asynchronously
     (async () => {
       try {
+        await resultResetPersisted;
         await worktreePersisted;
         const workingDirectory = worktreePath || task.repoPath || process.cwd();
-        const hasGit = fs.existsSync(path.join(workingDirectory, '.git'));
+        const managesRepository = Boolean(task.repoPath || worktreePath);
+        const hasGit = managesRepository && fs.existsSync(path.join(workingDirectory, '.git'));
+        const startHeadSha = hasGit ? readGitHead(workingDirectory) : undefined;
         const systemPrompt = buildAgentSystemPrompt(task, workingDirectory, worktreePath, hasGit);
         const revisionPushPermission = resolveRevisionPushPermission(task, options.revision);
 
@@ -1270,32 +1359,39 @@ export class AgentManager {
 
         // Primary completion path — status comes from the provider
         if (this.sessions.has(task.id)) {
-          // On success, persist the agent-authored summary BEFORE the status
-          // transition so the task-update broadcast carries it to clients.
-          // Always write (extracted value or null) so a rerun can't leave a
-          // stale summary from a previous run. Never let this block completion.
-          if (result.status === 'complete') {
-            try {
-              agentSummary = extractTaskSummary(summaryBuffer);
-              await this.eventRepo?.update(task.id, { summary: agentSummary });
-            } catch (err) {
-              console.error(`[agent-manager] failed to persist summary for task ${task.id}:`, errorMessage(err));
-            }
-          }
           let finalStatus = result.status;
           let finalError = result.error;
-          if (finalStatus === 'complete' && options.revision) {
+          if (finalStatus === 'complete') {
             try {
-              commitSha = inspectRevisionCompletion(
-                task,
-                workingDirectory,
-                feedbackProhibitsOperation(options.revision.feedback, 'commit'),
-              );
-              pushed = revisionPushPermission.allowed
-                && isRevisionCommitOnRemote(task, workingDirectory, commitSha);
+              agentSummary = extractTaskSummary(summaryBuffer);
+              let endHeadSha: string | undefined;
+              if (managesRepository) {
+                const gitResult = inspectRunCompletion(task, workingDirectory, startHeadSha);
+                commitSha = gitResult.commitSha;
+                endHeadSha = gitResult.endHeadSha;
+                if (gitResult.noChanges && !agentSummary) {
+                  agentSummary = '## Completed\nNo changes were required.';
+                }
+              }
+              if (!agentSummary) {
+                agentSummary = commitSha
+                  ? `## Completed\nChanges committed at ${commitSha}.`
+                  : '## Completed\nTask completed with no repository changes.';
+              }
+              if (!this.eventRepo) throw new Error('task repository is unavailable');
+              const persisted = await this.eventRepo.update(task.id, {
+                summary: agentSummary,
+                commitSha: commitSha ?? null,
+              });
+              if (!persisted) throw new Error('task result could not be saved');
+              if (options.revision) {
+                pushed = revisionPushPermission.allowed
+                  && isRevisionCommitOnRemote(task, workingDirectory, endHeadSha);
+                if (pushed && !commitSha) commitSha = endHeadSha;
+              }
             } catch (err: unknown) {
               finalStatus = 'failed';
-              finalError = `Revision validation failed: ${errorMessage(err)}`;
+              finalError = `Completion validation failed: ${errorMessage(err)}`;
             }
           }
           await terminateOnce(finalStatus, finalError);

@@ -35,6 +35,8 @@ export interface Task {
   attachments?: TaskAttachment[];
   projectId: string;
   summary?: string | null;
+  /** Commit created by the latest successful run; null when it completed with no file changes. */
+  commitSha?: string | null;
   /** Existing pull request for this task branch, persisted across reloads. */
   prUrl?: string | null;
   runRequestedAt?: number;
