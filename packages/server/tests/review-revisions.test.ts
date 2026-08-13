@@ -17,6 +17,7 @@ import { createGitRouter } from '../src/routes/git.js';
 import type { Task } from '../src/types.js';
 import {
   AgentManager,
+  assertRevisionWorkingBranch,
   buildAgentExecutionPrompt,
   buildAgentSystemPrompt,
   evaluateRevisionToolUse,
@@ -765,6 +766,62 @@ test('explicit merge authorization remains opt-in and high-confidence', () => {
     prUrl: 'https://example.test/pull/1',
   });
   assert.match(prompt, /feedback explicitly authorizes merge/i);
+});
+
+test('revision branch guard fails fast unless the working directory is on the task branch', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-revision-branch-guard-'));
+  const git = (args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' }).toString().trim();
+  try {
+    git(['init', '-b', 'task/review-flow']);
+    git(['config', 'user.email', 'test@example.invalid']);
+    git(['config', 'user.name', 'Agent Board Test']);
+    fs.writeFileSync(path.join(root, 'README.md'), '# initial\n');
+    git(['add', 'README.md']);
+    git(['commit', '-m', 'initial']);
+    git(['checkout', '-b', 'main']);
+    const task = { ...reviewTask(), repoPath: root };
+
+    git(['checkout', 'task/review-flow']);
+    assert.doesNotThrow(() => assertRevisionWorkingBranch(task, root));
+
+    git(['checkout', 'main']);
+    assert.throws(
+      () => assertRevisionWorkingBranch(task, root),
+      /must start on the task branch task\/review-flow[\s\S]*is on main/,
+    );
+
+    git(['checkout', '--detach', 'HEAD']);
+    assert.throws(
+      () => assertRevisionWorkingBranch(task, root),
+      /detached HEAD/,
+    );
+
+    // Without a branch or repo to enforce, the guard is a no-op on any branch.
+    assert.doesNotThrow(() => assertRevisionWorkingBranch({ ...task, branchName: undefined }, root));
+    assert.doesNotThrow(() => assertRevisionWorkingBranch({ ...task, repoPath: undefined }, root));
+    assert.throws(
+      () => assertRevisionWorkingBranch({ ...task, branchName: 'not a valid branch!' }, root),
+      /not a valid git branch name/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('revision prompt confines all work to the task branch', () => {
+  const prompt = buildAgentExecutionPrompt(reviewTask(), {
+    revisionId: 'revision-branch',
+    feedback: 'Fix the CI failure',
+    prUrl: 'https://example.test/pull/1',
+  });
+  assert.match(prompt, /Branch confinement: all work for this revision happens on the existing task branch `task\/review-flow`/);
+  assert.match(prompt, /Do not create, rename, delete, switch to, or commit on any other branch, and do not detach HEAD/);
+
+  const noBranchPrompt = buildAgentExecutionPrompt({ ...reviewTask(), branchName: undefined }, {
+    revisionId: 'revision-no-branch',
+    feedback: 'Fix the CI failure',
+  });
+  assert.doesNotMatch(noBranchPrompt, /Branch confinement/);
 });
 
 test('no-commit revision with local changes requires attention and preserves the files', () => {

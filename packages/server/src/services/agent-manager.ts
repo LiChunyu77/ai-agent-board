@@ -303,6 +303,9 @@ export function buildAgentExecutionPrompt(task: Task, revision?: AgentRevisionCo
   const commitInstructions = commitProhibited
     ? 'The review feedback explicitly prohibits commit. Do not create a commit, and do not stage files solely for committing.'
     : 'If you changed files, review the diff and create a concise commit after tests pass.';
+  const branchInstructions = branchName
+    ? `Branch confinement: all work for this revision happens on the existing task branch \`${branchName}\`. Do not create, rename, delete, switch to, or commit on any other branch, and do not detach HEAD — commits anywhere else are rejected.`
+    : undefined;
 
   return [
     'This is a NEW revision execution round. Do not attempt to resume or message the previous agent session.',
@@ -322,10 +325,34 @@ export function buildAgentExecutionPrompt(task: Task, revision?: AgentRevisionCo
     '',
     '## Default Git and pull request policy (subordinate to review feedback)',
     commitInstructions,
+    ...(branchInstructions ? [branchInstructions] : []),
     pushInstructions,
     mergeInstructions,
     'Never force-push. Never edit a file that the review feedback explicitly says not to modify.',
   ].join('\n');
+}
+
+/**
+ * Pre-execution guard: a revision must start on the task branch so its commits
+ * cannot land on the wrong branch. The post-completion check in
+ * inspectRevisionCompletion only detects the problem after the commits already
+ * exist; this guard fails the run before the agent does any work. Throws on
+ * mismatch; no-op when the task has no repoPath/branchName to enforce.
+ */
+export function assertRevisionWorkingBranch(task: Task, workingDirectory: string): void {
+  if (!task.repoPath || !task.branchName) return;
+  assertSafeGitBranch(task.branchName, 'branchName');
+  const currentBranch = execFileSync('git', ['branch', '--show-current'], {
+    cwd: workingDirectory,
+    stdio: 'pipe',
+  }).toString().trim();
+  if (currentBranch !== task.branchName) {
+    throw new Error(
+      `Revision must start on the task branch ${task.branchName}, but the working directory is on ` +
+      `${currentBranch || 'detached HEAD'}. Check out the task branch (or enable worktree isolation) ` +
+      'before requesting changes so revision commits cannot land on the wrong branch.',
+    );
+  }
 }
 
 /** Validate the revision's final git state without overriding an explicit no-commit instruction. */
@@ -1188,6 +1215,18 @@ export class AgentManager {
         const workingDirectory = worktreePath || task.repoPath || process.cwd();
         const managesRepository = Boolean(task.repoPath || worktreePath);
         const hasGit = managesRepository && fs.existsSync(path.join(workingDirectory, '.git'));
+
+        // A revision must never start on the wrong branch: fail fast before the
+        // agent does any work, so no commits can land outside the task branch.
+        if (options.revision) {
+          try {
+            assertRevisionWorkingBranch(task, workingDirectory);
+          } catch (err: unknown) {
+            await terminateOnce('failed', errorMessage(err));
+            return;
+          }
+        }
+
         const startHeadSha = hasGit ? readGitHead(workingDirectory) : undefined;
         const systemPrompt = buildAgentSystemPrompt(task, workingDirectory, worktreePath, hasGit);
         const revisionPushPermission = resolveRevisionPushPermission(task, options.revision);
