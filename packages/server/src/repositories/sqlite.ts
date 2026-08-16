@@ -211,8 +211,15 @@ export class SqliteTaskRepository implements TaskRepository {
       } throw err;
     }
   }
-  async requestRun(id: string, at: number) { this.db.prepare('UPDATE tasks SET run_requested_at=?, run_claimed_at=NULL WHERE id=?').run(at,id); return this.getById(id); }
-  async claimRun(id: string, at: number) { const staleBefore=at-30_000; const r=this.db.prepare("UPDATE tasks SET run_claimed_at=? WHERE id=? AND run_requested_at IS NOT NULL AND (run_claimed_at IS NULL OR run_claimed_at < ?) AND agent_status IN ('idle','planning')").run(at,id,staleBefore); return r.changes ? this.getById(id) : undefined; }
+  async requestRun(id: string, at: number) {
+    const staleBefore = at - 30_000;
+    const r = this.db.prepare(`UPDATE tasks SET
+      run_requested_at=?,
+      run_claimed_at=NULL
+      WHERE id=? AND (run_claimed_at IS NULL OR run_claimed_at < ?) AND (run_requested_at IS NULL OR run_requested_at < ?)`).run(at, id, staleBefore, staleBefore);
+    return r.changes ? this.getById(id) : undefined;
+  }
+  async claimRun(id: string, at: number) { const staleBefore=at-30_000; const r=this.db.prepare("UPDATE tasks SET run_claimed_at=? WHERE id=? AND run_requested_at IS NOT NULL AND (run_claimed_at IS NULL OR run_claimed_at < ?) AND agent_status IN ('idle','planning','failed')").run(at,id,staleBefore); return r.changes ? this.getById(id) : undefined; }
   async clearRun(id: string) { this.db.prepare('UPDATE tasks SET run_requested_at=NULL, run_claimed_at=NULL WHERE id=?').run(id); return this.getById(id); }
   async getPendingRuns(staleBefore = Date.now()-30_000) { return (this.db.prepare("SELECT * FROM tasks WHERE run_requested_at IS NOT NULL AND (run_claimed_at IS NULL OR run_claimed_at < ?) AND agent_status IN ('idle','planning') ORDER BY run_requested_at").all(staleBefore) as TaskRow[]).map(rowToTask); }
 
