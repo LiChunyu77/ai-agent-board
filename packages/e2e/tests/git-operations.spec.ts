@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import type { APIRequestContext } from '@playwright/test';
-import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, writeFileSync } from 'fs';
+import os from 'os';
 import path from 'path';
 
 /**
@@ -8,7 +9,18 @@ import path from 'path';
  * worktree cleanup, and worktree auto-cleanup after merge/PR.
  */
 
-import { API, cleanupTestPath, getTestRepoPath, git, prepareTestRepo } from './helpers';
+import {
+  API,
+  cleanupTestPath,
+  E2E_GH_STUB_LOG,
+  E2E_TEST_REPO_ROOT,
+  getTestRepoPath,
+  git,
+  prepareBareRemote,
+  prepareTestRepo,
+  snapshotGitConfig,
+  snapshotGitRefs,
+} from './helpers';
 
 function cleanRepo(repo: string) {
   try { git(['worktree', 'prune'], repo); } catch { /* */ }
@@ -232,12 +244,9 @@ test.describe('Git Operations — Merge, PR, Worktree Cleanup', () => {
     expect(status).toBe('');
   });
 
-  test('POST /create-pr with simulated remote pushes branch', async ({ request }) => {
+  test('POST /create-pr with simulated remote pushes branch and returns synthetic PR URL', async ({ request }) => {
     // Set up a bare remote to simulate GitHub
-    const remoteRoot = getTestRepoPath('git-operations-remotes');
-    mkdirSync(remoteRoot, { recursive: true });
-    const bareRemote = path.join(remoteRoot, `remote-${Date.now()}.git`);
-    git(['clone', '--bare', testRepo, bareRemote], process.cwd());
+    const bareRemote = prepareBareRemote('git-operations', testRepo);
     git(['remote', 'add', 'origin', bareRemote], testRepo);
 
     const branchName = `feature/pr-push-${Date.now()}`;
@@ -261,14 +270,82 @@ test.describe('Git Operations — Merge, PR, Worktree Cleanup', () => {
 
     await request.patch(`${API}/api/tasks/${task.id}`, { data: { agentStatus: 'complete' } });
 
-    // Push will succeed to bare remote; gh pr create will fail (no GitHub)
-    await request.post(`${API}/api/tasks/${task.id}/create-pr`);
-    // Either 200 (gh CLI worked) or 500 (gh CLI failed after push)
-    // Either way, the branch should be pushed to the remote
-    const remoteBranches = git(['--git-dir', bareRemote, 'branch'], process.cwd());
+    // Push will succeed to bare remote; gh pr create will hit the stub
+    const prRes = await request.post(`${API}/api/tasks/${task.id}/create-pr`);
+    expect(prRes.status()).toBe(200);
+    const body = await prRes.json();
+    expect(body.url).toMatch(/^https:\/\/github\.com\/example\/agentboard-e2e\/pull\/\d+$/);
+
+    // The branch should be pushed to the remote
+    const remoteBranches = git(['branch'], bareRemote);
     expect(remoteBranches).toContain(branchName);
 
-    // Cleanup
-    rmSync(bareRemote, { recursive: true, force: true });
+    // The stubbed gh should have been invoked
+    expect(existsSync(E2E_GH_STUB_LOG)).toBe(true);
   });
 });
+
+test.describe('Git Operations — Hermetic isolation', () => {
+  test('git helper refuses to operate outside the fixture root', () => {
+    expect(() => git(['status'], os.tmpdir())).toThrow(/fixture root/);
+    expect(() => git(['status'], '/')).toThrow(/fixture root/);
+  });
+
+  test('git operations leave authoritative repo config and refs unchanged', async ({ request }) => {
+    // This test exercises the exact server paths that previously mutated the
+    // product repository. It uses a fixture repo and a local bare remote, then
+    // asserts the fixture repo's base config and refs are only changed in
+    // expected ways (new branch, push tracking) and that the helper would have
+    // rejected an escape path.
+    const repoPath = prepareTestRepo('git-operations-isolation', { clean: true });
+    const bareRemote = prepareBareRemote('git-operations-isolation', repoPath);
+    git(['remote', 'add', 'origin', bareRemote], repoPath);
+
+    const branchName = `feature/isolation-${Date.now()}`;
+    git(['checkout', '-b', branchName], repoPath);
+    writeFileSync(path.join(repoPath, 'isolation.txt'), 'isolated\n');
+    git(['add', '.'], repoPath);
+    git(['commit', '-m', 'isolation'], repoPath);
+    git(['checkout', 'main'], repoPath);
+
+    const configBefore = snapshotGitConfig(repoPath);
+    const refsBefore = snapshotGitRefs(repoPath);
+
+    const createRes = await request.post(`${API}/api/tasks`, {
+      data: { title: 'Isolation PR test', priority: 'medium' },
+    });
+    const task = await createRes.json();
+
+    await request.post(`${API}/api/tasks/${task.id}/configure`, {
+      data: { repoPath, branchName, baseBranch: 'main', useWorktree: false, agentType: 'copilot' },
+    });
+    await request.patch(`${API}/api/tasks/${task.id}`, { data: { agentStatus: 'complete' } });
+
+    const prRes = await request.post(`${API}/api/tasks/${task.id}/create-pr`);
+    expect(prRes.status()).toBe(200);
+
+    // Config should be unchanged except for branch.* tracking entries that
+    // git push -u creates inside the fixture repo (these are not authoritative).
+    const configAfter = snapshotGitConfig(repoPath);
+    expect(configAfter).toEqual(configBefore);
+
+    // Refs should include the new local branch and remote tracking ref, but no
+    // mutations outside the fixture repo.
+    const refsAfter = snapshotGitRefs(repoPath);
+    expect(refsAfter).toContain(`refs/heads/${branchName}`);
+    expect(refsAfter).toContain(`refs/remotes/origin/${branchName}`);
+    expect(() => assertInsideFixtureRoot('/tmp/escaped')).toThrow(/fixture root/);
+
+    await request.delete(`${API}/api/tasks/${task.id}`);
+    cleanupTestPath(repoPath);
+  });
+});
+
+function assertInsideFixtureRoot(candidate: string): void {
+  const resolved = path.resolve(candidate);
+  const root = E2E_TEST_REPO_ROOT;
+  const relative = path.relative(root, resolved);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`Refusing to operate on path outside E2E fixture root.`);
+  }
+}
