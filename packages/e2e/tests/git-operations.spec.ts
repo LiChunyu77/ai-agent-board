@@ -1,6 +1,8 @@
 import { test, expect } from '@playwright/test';
 import type { APIRequestContext } from '@playwright/test';
-import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { existsSync, writeFileSync } from 'fs';
+import os from 'os';
 import path from 'path';
 
 /**
@@ -8,7 +10,16 @@ import path from 'path';
  * worktree cleanup, and worktree auto-cleanup after merge/PR.
  */
 
-import { API, cleanupTestPath, getTestRepoPath, git, prepareTestRepo } from './helpers';
+import {
+  API,
+  assertInsideFixtureRoot,
+  cleanupTestPath,
+  E2E_GH_STUB_LOG,
+  getTestRepoPath,
+  git,
+  prepareBareRemote,
+  prepareTestRepo,
+} from './helpers';
 
 function cleanRepo(repo: string) {
   try { git(['worktree', 'prune'], repo); } catch { /* */ }
@@ -233,11 +244,7 @@ test.describe('Git Operations — Merge, PR, Worktree Cleanup', () => {
   });
 
   test('POST /create-pr with simulated remote pushes branch', async ({ request }) => {
-    // Set up a bare remote to simulate GitHub
-    const remoteRoot = getTestRepoPath('git-operations-remotes');
-    mkdirSync(remoteRoot, { recursive: true });
-    const bareRemote = path.join(remoteRoot, `remote-${Date.now()}.git`);
-    git(['clone', '--bare', testRepo, bareRemote], process.cwd());
+    const bareRemote = prepareBareRemote('git-operations-remotes', testRepo);
     git(['remote', 'add', 'origin', bareRemote], testRepo);
 
     const branchName = `feature/pr-push-${Date.now()}`;
@@ -261,14 +268,87 @@ test.describe('Git Operations — Merge, PR, Worktree Cleanup', () => {
 
     await request.patch(`${API}/api/tasks/${task.id}`, { data: { agentStatus: 'complete' } });
 
-    // Push will succeed to bare remote; gh pr create will fail (no GitHub)
-    await request.post(`${API}/api/tasks/${task.id}/create-pr`);
-    // Either 200 (gh CLI worked) or 500 (gh CLI failed after push)
-    // Either way, the branch should be pushed to the remote
-    const remoteBranches = git(['--git-dir', bareRemote, 'branch'], process.cwd());
+    // Push will succeed to bare remote; the stubbed gh pr create will return a
+    // synthetic URL so the test never contacts GitHub.
+    const prRes = await request.post(`${API}/api/tasks/${task.id}/create-pr`);
+    expect(prRes.status()).toBe(200);
+    const body = await prRes.json();
+    expect(body.url).toMatch(/^https:\/\/github\.com\/example\/agentboard-e2e\/pull\/\d+$/);
+
+    const remoteBranches = git(['branch'], bareRemote);
     expect(remoteBranches).toContain(branchName);
 
-    // Cleanup
-    rmSync(bareRemote, { recursive: true, force: true });
+    // The stubbed gh should have been invoked
+    expect(existsSync(E2E_GH_STUB_LOG)).toBe(true);
+
+    cleanupTestPath(bareRemote);
+  });
+});
+
+test.describe('Git Operations — Hermetic isolation', () => {
+  test('git helper refuses to operate outside the fixture root', () => {
+    expect(() => git(['status'], os.tmpdir())).toThrow(/fixture root/);
+    expect(() => git(['status'], '/')).toThrow(/fixture root/);
+  });
+
+  test('git operations leave authoritative repo config and refs unchanged', async ({ request }) => {
+    // Snapshot the product repository (read-only sentinel) before exercising
+    // the exact server paths that previously mutated it.
+    const productRepoRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    }).trim();
+
+    const configBefore = execFileSync('git', ['config', '--local', '--list'], {
+      cwd: productRepoRoot,
+      encoding: 'utf8',
+    });
+    const refsBefore = execFileSync('git', ['show-ref'], {
+      cwd: productRepoRoot,
+      encoding: 'utf8',
+    });
+
+    // Run a full create-pr flow inside a disposable fixture.
+    const repoPath = prepareTestRepo('git-operations-isolation', { clean: true });
+    const bareRemote = prepareBareRemote('git-operations-isolation', repoPath);
+    git(['remote', 'add', 'origin', bareRemote], repoPath);
+
+    const branchName = `feature/isolation-${Date.now()}`;
+    git(['checkout', '-b', branchName], repoPath);
+    writeFileSync(path.join(repoPath, 'isolation.txt'), 'isolated\n');
+    git(['add', '.'], repoPath);
+    git(['commit', '-m', 'isolation'], repoPath);
+    git(['checkout', 'main'], repoPath);
+
+    const createRes = await request.post(`${API}/api/tasks`, {
+      data: { title: 'Isolation PR test', priority: 'medium' },
+    });
+    const task = await createRes.json();
+
+    await request.post(`${API}/api/tasks/${task.id}/configure`, {
+      data: { repoPath, branchName, baseBranch: 'main', useWorktree: false, agentType: 'copilot' },
+    });
+    await request.patch(`${API}/api/tasks/${task.id}`, { data: { agentStatus: 'complete' } });
+
+    const prRes = await request.post(`${API}/api/tasks/${task.id}/create-pr`);
+    expect(prRes.status()).toBe(200);
+
+    // The authoritative checkout must be byte-for-byte unchanged.
+    const configAfter = execFileSync('git', ['config', '--local', '--list'], {
+      cwd: productRepoRoot,
+      encoding: 'utf8',
+    });
+    const refsAfter = execFileSync('git', ['show-ref'], {
+      cwd: productRepoRoot,
+      encoding: 'utf8',
+    });
+    expect(configAfter).toBe(configBefore);
+    expect(refsAfter).toBe(refsBefore);
+
+    // The exported guard (used by Git and cleanup paths) still rejects escapes.
+    expect(() => assertInsideFixtureRoot('/tmp/escaped')).toThrow(/fixture root/);
+
+    await request.delete(`${API}/api/tasks/${task.id}`);
+    cleanupTestPath(repoPath);
   });
 });

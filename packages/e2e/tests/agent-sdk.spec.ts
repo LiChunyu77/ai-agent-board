@@ -136,12 +136,13 @@ test.describe('Copilot SDK Agent', () => {
     const mainStatus = git(['status', '--porcelain'], testRepo).trim();
     expect(mainStatus).toBe('');
 
-    // 6. Verify worktree has changes
+    // 6. Verify worktree changes were persistently committed
     const finalTasks = await (await request.get(`${API}/api/tasks`)).json();
     const finalTask = getTaskByTitle(finalTasks, title);
     expect(finalTask.worktreePath).toBeTruthy();
-    const wtDiff = git(['diff', 'HEAD', '--', 'README.md'], finalTask.worktreePath);
-    expect(wtDiff.length).toBeGreaterThan(0);
+    expect(finalTask.commitSha).toMatch(/^[0-9a-f]{40,64}$/i);
+    expect(git(['rev-parse', 'HEAD'], finalTask.worktreePath).trim()).toBe(finalTask.commitSha);
+    expect(git(['status', '--porcelain'], finalTask.worktreePath)).toBe('');
 
     // 7. Open agent panel in UI and verify events rendered.
     // Review/done tasks default to the Summary tab, so switch to Events first.

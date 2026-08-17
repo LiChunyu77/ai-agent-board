@@ -15,6 +15,7 @@ import { createGroupsRouter } from './routes/groups.js';
 import { createAttachmentsRouter } from './routes/attachments.js';
 import { createProjectsRouter } from './routes/projects.js';
 import { createOrchestrationsRouter } from './routes/orchestrations.js';
+import { createRevisionsRouter } from './routes/revisions.js';
 import type { AttachmentStore } from './repositories/attachment-types.js';
 import { AgentManager } from './services/agent-manager.js';
 import { authMiddleware } from './middleware/auth.js';
@@ -92,6 +93,7 @@ const agentManager = new AgentManager();
   app.use('/api/projects', createProjectsRouter(projectRepo, taskRepo, groupRepo, agentManager));
   app.use('/api/orchestrations', createOrchestrationsRouter(taskRepo, projectRepo, agentManager));
   app.use('/api/tasks', createTaskRouter(taskRepo, agentManager, projectRepo));
+  app.use('/api/tasks', createRevisionsRouter(taskRepo, agentManager));
   app.use('/api/tasks', createAgentRouter(taskRepo, agentManager, groupRepo, projectRepo));
   app.use('/api/tasks', createGitRouter(taskRepo, agentManager));
   app.use('/api/templates', createTemplateRouter(templateRepo));
@@ -173,6 +175,13 @@ const agentManager = new AgentManager();
       && !recoveredRunIds.has(t.id)
   );
   for (const task of orphaned) {
+    const activeRevision = await taskRepo.getActiveRevisionByTaskId(task.id);
+    if (activeRevision) {
+      await taskRepo.updateRevision(activeRevision.id, {
+        status: 'failed',
+        completedAt: Date.now(),
+      });
+    }
     await taskRepo.update(task.id, {
       agentStatus: 'failed',
       completedAt: Date.now(),

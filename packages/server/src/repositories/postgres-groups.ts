@@ -40,6 +40,7 @@ interface TaskRow {
   group_id: string | null;
   group_order: number | null;
   timeout_minutes: number | null;
+  pr_url: string | null;
 }
 
 function rowToGroup(row: GroupRow): TaskGroup {
@@ -82,6 +83,7 @@ function rowToTask(row: TaskRow): Task {
     groupId: row.group_id ?? undefined,
     groupOrder: row.group_order ?? undefined,
     timeoutMinutes: row.timeout_minutes ?? undefined,
+    prUrl: row.pr_url ?? null,
   };
 }
 

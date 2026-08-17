@@ -41,6 +41,7 @@ ai-agent-board/
 - **Event streaming** — SDK events mapped to `AgentEvent`s, persisted to database, broadcast via WebSocket. In-memory LRU cache (200 tasks max, 100 events per task).
 - **Git worktrees** — optional per-task branch isolation. Agent works in worktree directory, path rewriting via `onPreToolUse` hook. Worktrees auto-cleaned after successful merge or PR creation.
 - **Local merge** — `mergeLocal()` merges worktree branch into base branch locally with per-repo mutex to prevent concurrent checkout races. Auto-aborts on conflict.
+- **Revision branch safety** — revision runs fail fast before execution unless the working directory is on the task branch (`assertRevisionWorkingBranch`), the revision prompt confines all work to that branch, and `inspectRunCompletion` re-validates branch, clean tree, and commit ancestry after the run.
 - **Smart PR/merge buttons** — `GET /api/tasks/:id/git-info` checks for remote; UI shows "Create PR" only when remote exists, "Merge to main" always available.
 - **Vite proxy** — client proxies `/api` and `/ws` to the server.
 - **Shared validation** — `shared/constants.ts` exports validators (`isValidPriority`, `isValidColumnId`, etc.) and limits (`MAX_TITLE_LENGTH`, `MAX_DESCRIPTION_LENGTH`) used by both client and server.

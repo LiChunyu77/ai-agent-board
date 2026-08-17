@@ -38,11 +38,13 @@ export function createGitRouter(repo: TaskRepository, agentManager: AgentManager
     }
     try {
       const result = agentManager.createPR(task);
+      const updates = { prUrl: result.url, worktreePath: undefined };
       // Clean up worktree after successful PR — branch is pushed, directory is no longer needed
       if (task.worktreePath) {
         try { agentManager.removeWorktree(task); } catch { /* best effort */ }
-        await repo.update(id, { worktreePath: undefined });
       }
+      const updated = await repo.update(id, updates);
+      if (updated) broadcastTaskUpdate(updated);
       res.json(result);
     } catch (err: unknown) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to create PR' });

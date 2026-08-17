@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import path from 'path';
-import type { Task } from '../types.js';
+import { randomUUID } from 'crypto';
+import type { Task, AgentEvent } from '../types.js';
 import { isValidAgentType, VALID_AGENT_TYPES } from '@ai-agent-board/shared/constants.js';
 import type { TaskRepository } from '../repositories/types.js';
 import type { TaskGroupRepository } from '../repositories/group-types.js';
@@ -118,11 +119,73 @@ export function createAgentRouter(
       return;
     }
 
-    // Persist intent before claiming; a crash between these operations is recovered at startup.
-    agentManager.resetEvents(task.id);
-    await repo.requestRun(task.id, Date.now());
+    // Durable state claims a run is in progress, but no agent session exists.
+    // Recover to a visible failed state in a single persistence write, then
+    // broadcast an explanatory error event and require an explicit user retry.
+    if (task.agentStatus === 'planning' || task.agentStatus === 'executing') {
+      const now = Date.now();
+      const recovered = await repo.update(task.id, {
+        agentStatus: 'failed',
+        completedAt: now,
+        runRequestedAt: undefined,
+        runClaimedAt: undefined,
+      });
+      if (!recovered) {
+        res.status(500).json({ error: 'failed to recover orphaned run state' });
+        return;
+      }
+      const event: AgentEvent = {
+        id: randomUUID(),
+        taskId: task.id,
+        type: 'error',
+        content: `Agent session lost while task was ${task.agentStatus}; explicit retry required.`,
+        timestamp: now,
+        metadata: {
+          agentType: task.agentType,
+          duration: 0,
+          error: 'Agent session lost',
+        },
+      };
+      await repo.insertEvent(event);
+      broadcast({ type: 'agent_event', payload: event });
+      broadcast({
+        type: 'agent_complete',
+        payload: {
+          taskId: task.id,
+          status: 'failed',
+          agentType: task.agentType,
+          duration: 0,
+          eventCount: 1,
+        },
+      });
+      broadcastTaskUpdate(recovered);
+      res.status(409).json({ error: 'agent session lost; explicit retry required' });
+      return;
+    }
+
+    // Complete tasks are not re-runnable through ordinary Run; clean any stale claim.
+    if (task.agentStatus === 'complete') {
+      if (task.runRequestedAt || task.runClaimedAt) {
+        const cleared = await repo.clearRun(task.id);
+        if (cleared) broadcastTaskUpdate(cleared);
+      }
+      res.status(409).json({ error: 'task already complete' });
+      return;
+    }
+
+    // Persist intent atomically. A valid, unexpired claim from another request
+    // causes this request to fail fast without overwriting the winner's intent.
+    const requested = await repo.requestRun(task.id, Date.now());
+    if (!requested) {
+      res.status(409).json({ error: 'run already claimed' });
+      return;
+    }
+
     const claimed = await repo.claimRun(task.id, Date.now());
-    if (!claimed) { res.status(409).json({ error: 'run already claimed' }); return; }
+    if (!claimed) {
+      res.status(409).json({ error: 'run already claimed' });
+      return;
+    }
 
     const updates: Partial<Task> = {
       agentStatus: 'planning',
@@ -134,9 +197,15 @@ export function createAgentRouter(
     }
     const updated = await repo.update(task.id, updates);
     if (!updated) {
-      res.status(404).json({ error: 'task not found' });
+      // The claim succeeded but the planning state could not be persisted.
+      // Clean the durable claim so the task remains retryable.
+      await repo.clearRun(task.id);
+      res.status(500).json({ error: 'failed to persist run state' });
       return;
     }
+
+    // Only clear prior events once the new run is fully persisted and about to start.
+    agentManager.resetEvents(task.id);
     broadcastTaskUpdate(updated);
 
     // E8: If this task belongs to a group in 'review', move group back to in-progress
@@ -154,7 +223,6 @@ export function createAgentRouter(
     agentManager.startAgent(
       updated,
       async (status) => {
-        if (status === 'complete' || status === 'failed') await repo.clearRun(task.id);
         await makeStatusCallback(repo, task.id)(status);
       },
       makeWorktreeCallback(repo, task.id),

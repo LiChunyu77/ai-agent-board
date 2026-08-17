@@ -6,6 +6,18 @@ const repoRoot = path.resolve(__dirname, '..');
 const isWindows = process.platform === 'win32';
 const dbPath = path.join(repoRoot, 'packages', 'e2e', 'test-results', 'agentboard-e2e.db');
 const agentboardHome = path.join(repoRoot, 'packages', 'e2e', 'test-results', 'agentboard-home');
+
+// E2E fixtures live in a dedicated directory so the authoritative product
+// checkout is never an allowed repo root. If the harness forgot to set the
+// variable, fail closed rather than falling back to the repo root.
+const fixtureRoot = process.env.E2E_TEST_REPO_ROOT
+  ? path.resolve(process.env.E2E_TEST_REPO_ROOT)
+  : null;
+if (!fixtureRoot) {
+  console.error('[e2e-server] E2E_TEST_REPO_ROOT is not set');
+  process.exit(1);
+}
+
 function portFromEnv(name, fallback) {
   const value = process.env[name] || fallback;
   if (!/^\d+$/.test(value)) {
@@ -15,8 +27,11 @@ function portFromEnv(name, fallback) {
 }
 const serverPort = portFromEnv('E2E_SERVER_PORT', '3002');
 const clientPort = portFromEnv('E2E_CLIENT_PORT', '4176');
+
+// Only allow repos under the fixture root or system temp directories.
+// The product repository root is intentionally excluded.
 const allowedRepoRoots = [
-  repoRoot,
+  fixtureRoot,
   process.env.TEMP,
   process.env.TMP,
   process.env.TMPDIR,
@@ -38,6 +53,7 @@ const child = spawn(isWindows ? 'npx tsx src/index.ts' : 'npx', isWindows ? [] :
     ALLOWED_ORIGINS: `http://localhost:${clientPort}`,
     ALLOWED_REPO_ROOTS: allowedRepoRoots,
     AGENTBOARD_HOME: agentboardHome,
+    GH_CONFIG_DIR: process.env.GH_CONFIG_DIR || '',
     // E2E never runs real agents; skip booting agent SDK clients so an
     // unauthenticated environment can't crash the server on startup.
     AGENTBOARD_DISABLE_AGENT_STARTUP: '1',
