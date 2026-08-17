@@ -1,5 +1,6 @@
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
+const { sanitizeGitEnv } = require('./sanitize-git-env.cjs');
 
 const repoRoot = path.resolve(__dirname, '..');
 const isWindows = process.platform === 'win32';
@@ -15,9 +16,13 @@ const args = isWindows
     ]
   : [path.join(repoRoot, 'scripts', 'required-gate.sh')];
 
+// Sanitize repository-local Git environment variables at the central gate
+// subprocess boundary. A pre-push hook inherits GIT_DIR/GIT_WORK_TREE from the
+// outer Git process; without stripping them here, downstream E2E git commands
+// would ignore their explicit fixture cwd and mutate the product repository.
 const result = spawnSync(command, args, {
   cwd: repoRoot,
-  env: process.env,
+  env: sanitizeGitEnv(process.env),
   stdio: 'inherit',
 });
 
