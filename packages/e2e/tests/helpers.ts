@@ -2,7 +2,6 @@ import type { Page } from '@playwright/test';
 import { expect } from '@playwright/test';
 import { execFileSync } from 'child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
-import os from 'os';
 import path from 'path';
 
 const TEST_SERVER_PORT = process.env.E2E_SERVER_PORT ?? '3002';
@@ -21,15 +20,15 @@ export const E2E_GH_STUB_LOG = process.env.E2E_GH_STUB_LOG
 
 /**
  * Return the absolute fixture root used for all E2E repositories and remotes.
- * Defaults to `<cwd>/test-results/repos` but can be overridden with
- * E2E_TEST_REPO_ROOT. Throws if the resolved path is the product repository
- * root itself or not absolute, so fixture setup never falls back to the
- * authoritative checkout.
+ * Defaults to `<cwd>/test-results` but can be overridden with
+ * E2E_TEST_REPO_ROOT. Throws if the raw env value is relative, the resolved
+ * path is not absolute, or it equals the product repository root.
  */
-function getFixtureRoot(): string {
-  const root = process.env.E2E_TEST_REPO_ROOT
-    ? path.resolve(process.env.E2E_TEST_REPO_ROOT)
-    : path.resolve(process.cwd(), 'test-results');
+export function getFixtureRoot(raw = process.env.E2E_TEST_REPO_ROOT): string {
+  if (raw && !path.isAbsolute(raw)) {
+    throw new Error(`E2E_TEST_REPO_ROOT must be an absolute path: ${raw}`);
+  }
+  const root = raw ? path.resolve(raw) : path.resolve(process.cwd(), 'test-results');
   if (!path.isAbsolute(root)) {
     throw new Error(`E2E fixture root must be an absolute path: ${root}`);
   }
@@ -61,14 +60,20 @@ function normalizeForCompare(p: string): string {
 }
 
 /**
- * Throw if `candidate` is not inside the E2E fixture root. Keeps every
- * Git-mutating test command scoped to explicit temporary fixtures.
+ * Throw if `candidate` is not a strict descendant of the E2E fixture root.
+ * Equality with the fixture root is also rejected so callers cannot delete or
+ * mutate the fixture root itself.
  */
 export function assertInsideFixtureRoot(candidate: string): void {
   const resolved = path.resolve(candidate);
-  const root = E2E_TEST_REPO_ROOT;
+  const root = path.resolve(E2E_TEST_REPO_ROOT);
   const relative = path.relative(root, resolved);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+  const escapes =
+    relative === '' ||
+    path.isAbsolute(relative) ||
+    relative === '..' ||
+    relative.startsWith(`..${path.sep}`);
+  if (escapes) {
     throw new Error(
       `Refusing to operate on path outside E2E fixture root.\n` +
       `  path: ${resolved}\n` +
@@ -85,9 +90,24 @@ export function assertInsideFixtureRoot(candidate: string): void {
  * URL. All other `gh` invocations exit 1 with a safe error so E2E tests cannot
  * contact GitHub or leak stored credentials.
  */
-export function createGhStub(): string {
-  const stubDir = E2E_GH_STUB_DIR;
-  const logPath = E2E_GH_STUB_LOG;
+export function createGhStub(
+  rawStubDir = process.env.E2E_GH_STUB_DIR,
+  rawLogPath = process.env.E2E_GH_STUB_LOG,
+): string {
+  if (rawStubDir && !path.isAbsolute(rawStubDir)) {
+    throw new Error(`E2E_GH_STUB_DIR must be an absolute path: ${rawStubDir}`);
+  }
+  if (rawLogPath && !path.isAbsolute(rawLogPath)) {
+    throw new Error(`E2E_GH_STUB_LOG must be an absolute path: ${rawLogPath}`);
+  }
+  const stubDir = path.resolve(rawStubDir ?? path.join(E2E_TEST_REPO_ROOT, 'gh-stub'));
+  const logPath = path.resolve(rawLogPath ?? path.join(stubDir, 'invocations.log'));
+
+  // Fail closed before any filesystem mutation: the stub directory and its log
+  // must live strictly inside the fixture root.
+  assertInsideFixtureRoot(stubDir);
+  assertInsideFixtureRoot(logPath);
+
   const isWindows = process.platform === 'win32';
   rmSync(stubDir, { recursive: true, force: true });
   mkdirSync(stubDir, { recursive: true });
@@ -96,25 +116,7 @@ export function createGhStub(): string {
   const nodeScript = path.join(stubDir, 'gh-stub.cjs');
   writeFileSync(
     nodeScript,
-    `#!/usr/bin/env node
-const fs = require('fs');
-const log = process.env.E2E_GH_STUB_LOG;
-if (log) {
-  fs.appendFileSync(log, JSON.stringify({ cwd: process.cwd(), argv: process.argv.slice(2) }) + '\\n');
-}
-const args = process.argv.slice(2);
-const prCreateIdx = args.findIndex((a, i) => a === 'pr' && args[i + 1] === 'create');
-if (prCreateIdx !== -1) {
-  const baseIdx = args.indexOf('--base', prCreateIdx);
-  const headIdx = args.indexOf('--head', prCreateIdx);
-  const base = baseIdx !== -1 ? args[baseIdx + 1] : 'main';
-  const head = headIdx !== -1 ? args[headIdx + 1] : 'feature';
-  console.log(\`https://github.com/example/agentboard-e2e/pull/\${Date.now()}\`);
-  process.exit(0);
-}
-console.error('gh stub: command not allowed in E2E');
-process.exit(1);
-`,
+    `#!/usr/bin/env node\nconst fs = require('fs');\nconst log = process.env.E2E_GH_STUB_LOG;\nif (log) {\n  fs.appendFileSync(log, JSON.stringify({ cwd: process.cwd(), argv: process.argv.slice(2) }) + '\\n');\n}\nconst args = process.argv.slice(2);\nconst prCreateIdx = args.findIndex((a, i) => a === 'pr' && args[i + 1] === 'create');\nif (prCreateIdx !== -1) {\n  const baseIdx = args.indexOf('--base', prCreateIdx);\n  const headIdx = args.indexOf('--head', prCreateIdx);\n  const base = baseIdx !== -1 ? args[baseIdx + 1] : 'main';\n  const head = headIdx !== -1 ? args[headIdx + 1] : 'feature';\n  console.log(\`https://github.com/example/agentboard-e2e/pull/\${Date.now()}\`);\n  process.exit(0);\n}\nconsole.error('gh stub: command not allowed in E2E');\nprocess.exit(1);\n`,
     { mode: 0o755 },
   );
 
